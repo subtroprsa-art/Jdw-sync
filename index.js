@@ -62,7 +62,7 @@ function parseJSON(envVar, name) {
     let raw = (process.env[envVar] || "").trim();
     raw = raw.replace(/\\\\n/g, "\\n");
     const obj = JSON.parse(raw);
-    if (obj.private_key) obj.private_key = obj.private_key.replace(/\\n/g, "\n");
+    if (obj.private_key) obj.private_key = obj.private_key.replace(/\n/g, "\n");
     console.log(`✅ Parsed ${name}`);
     return obj;
   } catch(e) {
@@ -147,6 +147,7 @@ function parseStockPdf(snippet, filename) {
   if (!snippet) return [];
   const results = [];
   const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+  console.log(`   🔍 Lines: ${lines.length}, GRNs: ${lines.filter(l=>/^\d{8}$/.test(l)).length}, sample: ${JSON.stringify(lines.slice(5,12))}`);
 
   const SKIP = ["CONSIGNMENT","JOHANNESBURG","FRESH PRODUCE","AGENT:","SALESMAN:","Version",
                 "Printed","Page","STOCK TAKE","R S A MARKET","GRN NO","COMMODITY","ARRIVE",
