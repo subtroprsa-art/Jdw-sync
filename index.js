@@ -6,6 +6,7 @@
  */
 
 const { google }  = require("googleapis");
+const pdfParse   = require("pdf-parse");
 const admin       = require("firebase-admin");
 const cron        = require("node-cron");
 const http        = require("http");
@@ -262,24 +263,19 @@ async function getSnippetById(fileId) {
 
 async function downloadPdfText(fileId) {
   try {
-    const res = await drive.files.export(
-      { fileId, mimeType: "text/plain" },
-      { responseType: "text" }
+    // Download raw PDF bytes
+    const res = await drive.files.get(
+      { fileId, alt: "media" },
+      { responseType: "arraybuffer" }
     );
-    return res.data || "";
+    const buffer = Buffer.from(res.data);
+    // Parse PDF and extract text
+    const data = await pdfParse(buffer);
+    console.log(`   📄 PDF extracted: ${data.text.length} chars`);
+    return data.text || "";
   } catch(e) {
-    try {
-      const res2 = await drive.files.get(
-        { fileId, alt: "media" },
-        { responseType: "arraybuffer" }
-      );
-      const text = Buffer.from(res2.data).toString("latin1");
-      const lines = text.split("\n").filter(l => l.trim().length > 3);
-      return lines.join("\n");
-    } catch(e2) {
-      console.warn("Could not download file " + fileId + ": " + e2.message);
-      return "";
-    }
+    console.warn("   ⚠️  PDF parse failed for " + fileId + ": " + e.message);
+    return "";
   }
 }
 

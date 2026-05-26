@@ -1,6 +1,6 @@
 {
   "name": "jdw-sync",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "Auto-syncs JHB Market sale slips from Google Drive to Firebase",
   "main": "index.js",
   "scripts": {
@@ -9,6 +9,7 @@
   "dependencies": {
     "firebase-admin": "^12.0.0",
     "googleapis": "^140.0.0",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "pdf-parse": "^1.1.1"
   }
 }
