@@ -239,8 +239,8 @@ function parseStockPdf(snippet, filename) {
     const commLine = commLines[i].line.replace(/\\/g,'');
     const parts = commLine.split(',');
     const commodity = parts[0] || 'UNK';
-    const variety   = (parts[2] || '*').replace(/\/g,'');
-    const count     = (parts[5] || '*').replace(/\/g,'');
+    const variety   = (parts[2] || '*').replace(/[\\]/g, '').trim();
+    const count     = (parts[5] || '*').replace(/[\\]/g, '').trim();
     const producer  = producerLines[i] || '';
 
     // Get qty numbers for this entry
