@@ -147,94 +147,122 @@ function parseStockPdf(snippet, filename) {
   if (!snippet) return [];
   const results = [];
   const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
-  console.log(`   🔍 Lines: ${lines.length}, GRNs: ${lines.filter(l=>/^\d{8}$/.test(l)).length}, sample: ${JSON.stringify(lines.slice(5,12))}`);
 
-  const SKIP = ["CONSIGNMENT","JOHANNESBURG","FRESH PRODUCE","AGENT:","SALESMAN:","Version",
-                "Printed","Page","STOCK TAKE","R S A MARKET","GRN NO","COMMODITY","ARRIVE",
-                "QTY","TRAN","COLD","SORT","SIT","RES","FLR","D/R","REC","SOLD"];
+  // pdf-parse reads columns left to right across the page
+  // Layout: [all producers] [all GRNs] [all commodities] [all qtys]
+  // We collect each type and zip them together
+
+  const grns = [];
+  const commodities = [];
+  const producers = {};  // index -> producer name
+
+  // First pass: find all GRNs and their indices
+  const grnIndices = [];
+  lines.forEach((line, idx) => {
+    if (/^\d{8}$/.test(line)) {
+      grns.push(line);
+      grnIndices.push(idx);
+    }
+  });
+
+  if (grns.length === 0) return [];
+
+  // Find commodity strings (contain commas and start with letters)
+  const commLines = [];
+  lines.forEach((line, idx) => {
+    if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(line)) {
+      commLines.push({ idx, line });
+    }
+  });
+
+  // The GRNs and commodities should be in the same order
+  // Match them by position: first N commodities match first N GRNs
+  const minLen = Math.min(grns.length, commLines.length);
+
+  // For each GRN, find producer (the non-numeric, non-header line just before the GRN block starts)
+  // GRNs are consecutive - find where the GRN block starts
+  const firstGrnIdx = grnIndices[0];
+  
+  // Producers appear before GRNs in groups
+  // Look for producer names between the start and the GRN block
+  // Actually from logs: producers appear BEFORE the whole GRN block
+  // They are consecutive just like GRNs
+  // Count: same number as GRNs
+  
+  // Find producer block: consecutive non-numeric, non-header lines just before GRNs
+  const SKIP_WORDS = ['CONSIGNMENT','JOHANNESBURG','AGENT:','SALESMAN:','Version','Printed',
+                       'Page','STOCK','R S A','GRN','COMMODITY','ARRIVE','COLD','SORT','SIT','RES',
+                       'TRAN','D/R','QTY','FLR','REC','SOLD','MARKET','PRODUCE','FRESH'];
+  
+  const producerLines = [];
+  for (let i = firstGrnIdx - 1; i >= 0; i--) {
+    const l = lines[i];
+    if (/^\d/.test(l) || l.indexOf(',') > 0) break;
+    if (l.length > 2 && !SKIP_WORDS.some(s => l.toUpperCase().includes(s))) {
+      producerLines.unshift(l);
+    }
+  }
+
+  // Collect quantity blocks after commodities
+  // Each GRN has: REC, then a combined sold+flr number
+  // Find number blocks after the last commodity
+  const lastCommIdx = commLines.length > 0 ? commLines[commLines.length-1].idx : 0;
+  
+  const allNums = [];
+  for (let i = lastCommIdx + 1; i < lines.length; i++) {
+    const t = lines[i].replace(/,/g,'');
+    if (/^\d+$/.test(t)) allNums.push(t);
+  }
 
   function extractFLR(combined, rec) {
-    combined = combined.replace(/,/g,"");
-    // Find last group of 2+ zeros then trailing digits
+    combined = String(combined).replace(/,/g,'');
     const m = combined.match(/0{2,}(\d+)$/);
     if (m) return parseInt(m[1]) || 0;
-    // Single zero then 2+ digits
     const m2 = combined.match(/0(\d{2,})$/);
     if (m2) { const c=parseInt(m2[1]); if(!rec||c<=rec) return c; }
-    // Last few digits vs rec
     if (combined.length > 4 && rec) {
       for (const ln of [3,4,2]) {
         if (combined.length >= ln) {
-          const c = parseInt(combined.slice(-ln).replace(/^0+/,"") || "0");
-          if (c >= 0 && c <= rec) return c;
+          const c = parseInt(combined.slice(-ln).replace(/^0+/,'') || '0');
+          if (c>=0 && c<=rec) return c;
         }
       }
     }
     return parseInt(combined) || 0;
   }
 
-  let i = 0;
-  while (i < lines.length) {
-    const line = lines[i];
-    if (/^\d{8}$/.test(line)) {
-      const grn = line;
-      if (results.length === 0) console.log(`   🔬 First GRN ${grn} at line ${i}, prev lines: ${JSON.stringify(lines.slice(Math.max(0,i-3),i+3))}`);
-      // Producer = nearest previous non-header non-numeric line
-      let producer = "";
-      for (let b = i-1; b >= Math.max(0,i-4); b--) {
-        const pl = lines[b];
-        if (/^\d/.test(pl) || pl.indexOf(",") > 0) break;
-        if (pl.length > 2 && !SKIP.some(s => pl.toUpperCase().includes(s))) {
-          producer = pl; break;
-        }
-      }
-      // Commodity line
-      const commLine = (lines[i+1] || "").replace(/\\/g,"");
-      const parts = commLine.split(",");
-      const commodity = (parts[0]||"").trim();
-      const variety   = (parts[2]||"*").trim().replace(/\\/g,"");
-      const count     = (parts[5]||"*").trim().replace(/\\/g,"");
+  // Each stock line uses 2 numbers: REC and SOLD+FLR combined (or 3: REC, SOLD, FLR)
+  // Try to pair numbers with GRNs
+  let numIdx = 0;
+  for (let i = 0; i < minLen; i++) {
+    const grn = grns[i];
+    const commLine = commLines[i].line.replace(/\\/g,'');
+    const parts = commLine.split(',');
+    const commodity = parts[0] || 'UNK';
+    const variety   = (parts[2] || '*').replace(/\/g,'');
+    const count     = (parts[5] || '*').replace(/\/g,'');
+    const producer  = producerLines[i] || '';
 
-      // Skip invalid
-      if (!commodity || !/^[A-Z]/.test(commodity)) { i++; continue; }
+    // Get qty numbers for this entry
+    const rec = parseInt((allNums[numIdx] || '0').replace(/,/g,'')) || 0;
+    numIdx++;
+    
+    let flr = 0;
+    // Check if next number(s) form the FLR
+    if (numIdx < allNums.length) {
+      const next = allNums[numIdx];
+      flr = extractFLR(next, rec);
+      numIdx++;
+    }
 
-      // Collect qty tokens after commodity
-      let j = i + 2, rec = 0;
-      const qtokens = [];
-      while (j < lines.length && j < i+10) {
-        const t = lines[j].trim().replace(/,/g,"");
-        if (/^\d+$/.test(t)) { qtokens.push(t); if(qtokens.length===1) rec=parseInt(t); j++; }
-        else break;
-      }
-
-      // Extract FLR
-      let flr = 0;
-      if (qtokens.length > 0) {
-        const last = qtokens[qtokens.length-1];
-        if (qtokens.length === 1) {
-          flr = parseInt(last) || 0;
-        } else {
-          flr = extractFLR(last, rec);
-        }
-      }
-
-      if (flr > 0) {
-        results.push({ grn, producer, commodity, variety, count, flr, src: filename });
-      }
-      i = j;
-    } else { i++; }
+    if (flr > 0 && commodity && /^[A-Z]/.test(commodity)) {
+      results.push({ grn, producer, commodity, variety, count, flr, src: filename });
+    }
   }
-  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename}`);
-  return results;
-}// ── Get today's date string DDMMYYYY ────────────────────────────────────────
-function todayStr() {
-  const d = new Date();
-  const dd = String(d.getDate()).padStart(2,"0");
-  const mm = String(d.getMonth()+1).padStart(2,"0");
-  const yyyy = d.getFullYear();
-  return `${dd}${mm}${yyyy}`;
-}
 
+  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename} (grns:${grns.length} comms:${commLines.length})`);
+  return results;
+}
 // ── Firebase & Drive init ────────────────────────────────────────────────────
 let db;
 function initFirebase() {
