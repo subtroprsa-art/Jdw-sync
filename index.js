@@ -340,6 +340,9 @@ async function syncStock() {
 
     // Always reprocess to pick up any parser improvements
     console.log(`   🔄 Processing stock for ${today}...`);
+    // Clear stockDate to force reprocess
+    await db.ref("jdw/stockDate").set(null);
+    await db.ref("jdw/stockFileCount").set(null);
 
     // Parse all of today's stock PDFs
     let allStock = [];
