@@ -3,43 +3,57 @@
  * Watches the JHB Market Buyer History folder in Google Drive.
  * Every 5 minutes it reads any new sale slip PDFs, parses them,
  * and pushes the updated history + rebuilt affinity model to Firebase.
- * Runs forever on Railway / Render (free tier).
  */
 
-const { google }       = require("googleapis");
-const admin            = require("firebase-admin");
-const cron             = require("node-cron");
+const { google }  = require("googleapis");
+const admin       = require("firebase-admin");
+const cron        = require("node-cron");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// CONFIG  – set these as environment variables on Railway/Render
-// ─────────────────────────────────────────────────────────────────────────────
 const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
-const STOCK_SCANS_FOLDER   = process.env.DRIVE_STOCK_SCANS_FOLDER_ID   || "1DrYmim6xThu6KfKRplr5SDBVZc-BFMBm";
-const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;          // e.g. https://jdw-crm-default-rtdb.firebaseio.com
+const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
 const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
 
-// ─────────────────────────────────────────────────────────────────────────────
-// FIREBASE INIT
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Robust JSON parser (handles mobile copy-paste issues) ────────────────────
+function parseJSON(envVar, name) {
+  try {
+    let raw = (process.env[envVar] || "").trim();
+    // remove any stray line breaks outside of string values
+    // fix private_key escaped newlines
+    raw = raw.replace(/\\\\n/g, "\\n");
+    const obj = JSON.parse(raw);
+    // ensure private_key has real newlines
+    if (obj.private_key) {
+      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
+    }
+    console.log(`✅ Parsed ${name}`);
+    return obj;
+  } catch(e) {
+    console.error(`❌ Could not parse ${name}: ${e.message}`);
+    console.error(`   First 100 chars: ${(process.env[envVar]||"").substring(0,100)}`);
+    throw e;
+  }
+}
+
+// ── Firebase ─────────────────────────────────────────────────────────────────
 let db;
 function initFirebase() {
   if (db) return;
-  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount),
-    databaseURL: FIREBASE_DB_URL,
-  });
+  const serviceAccount = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
+  if (!admin.apps.length) {
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      databaseURL: FIREBASE_DB_URL,
+    });
+  }
   db = admin.database();
-  console.log("✅ Firebase connected");
+  console.log("✅ Firebase connected to", FIREBASE_DB_URL);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GOOGLE DRIVE INIT
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Google Drive ─────────────────────────────────────────────────────────────
 let drive;
 function initDrive() {
   if (drive) return;
-  const credentials = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT);
+  const credentials = parseJSON("GOOGLE_SERVICE_ACCOUNT", "Google credentials");
   const auth = new google.auth.GoogleAuth({
     credentials,
     scopes: ["https://www.googleapis.com/auth/drive.readonly"],
@@ -48,92 +62,54 @@ function initDrive() {
   console.log("✅ Google Drive connected");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PARSE SLIP SNIPPET
-// Extracts buyer, GRN, commodity, variety, count, qty, price from Drive snippet
-// ─────────────────────────────────────────────────────────────────────────────
-function parseSlip(snippet, filename) {
-  if (!snippet) return [];
-  const rows = [];
-
-  const buyerMatch   = snippet.match(/BUYER:\s*([^\n]+)/);
-  const dateMatch    = snippet.match(/DATE:\s*(\d{2}\/[A-Z]+\/\d{4})/);
-  const buyer        = buyerMatch  ? buyerMatch[1].trim().replace(/\\/g, "") : "UNKNOWN";
-  const rawDate      = dateMatch   ? dateMatch[1] : "26/05/2026";
-
-  // normalise date to DD/MM/YYYY
-  const months = { JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",
-                   JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12" };
-  const dateParts = rawDate.match(/(\d{2})\/([A-Z]+)\/(\d{4})/);
-  const date = dateParts
-    ? `${dateParts[1]}/${months[dateParts[2]] || "05"}/${dateParts[3]}`
-    : rawDate;
-
-  // find all GRN blocks
-  const grnBlocks = [...snippet.matchAll(/GRN:\s*(\d+)\s*\nPRODUCER:[^\n]+\n([^\n]+)\n[\s\S]*?SALE\s+([\d,]+)\s*@\s*([\d.]+)/g)];
-
-  for (const m of grnBlocks) {
-    const grn       = m[1];
-    const commLine  = m[2].replace(/\\/g, "").replace(/\*;/g, "*,").trim();
-    const qty       = parseInt(m[3].replace(/,/g, "")) || 0;
-    const price     = parseFloat(m[4]) || 0;
-
-    // parse commodity line e.g. "AVOCADOS, 4KG TRAY, AF;CL 1;*;12;*;4 KG/L"
-    const { commodity, variety, count } = parseCommodityLine(commLine);
-
-    if (qty > 0) {
-      rows.push({ buyer, grn, commodity, variety, count, qty, price, date, src: filename });
-    }
-  }
-
-  // fallback: simpler pattern
-  if (rows.length === 0) {
-    const simpleGrn   = snippet.match(/GRN:\s*(\d+)/);
-    const simpleSale  = snippet.match(/SALE\s+([\d,]+)\s*@\s*([\d.]+)/);
-    const simpleComm  = snippet.match(/\n([A-Z][A-Z ,;:/*\d]+)\n/);
-    if (simpleGrn && simpleSale) {
-      const grn   = simpleGrn[1];
-      const qty   = parseInt(simpleSale[1].replace(/,/g, "")) || 0;
-      const price = parseFloat(simpleSale[2]) || 0;
-      const line  = simpleComm ? simpleComm[1] : "";
-      const { commodity, variety, count } = parseCommodityLine(line);
-      if (qty > 0) rows.push({ buyer, grn, commodity, variety, count, qty, price, date, src: filename });
-    }
-  }
-
-  return rows;
-}
-
+// ── Slip parser ───────────────────────────────────────────────────────────────
 function parseCommodityLine(line) {
-  line = line.toUpperCase();
+  line = (line || "").toUpperCase();
   let commodity = "UNK", variety = "*", count = "*";
-
-  if      (line.includes("AVOCADO")) commodity = "AVOS";
-  else if (line.includes("LEMON"))   commodity = "LEMS";
-  else if (line.includes("NAARTJ"))  commodity = "NAAR";
-  else if (line.includes("ORANGE"))  commodity = "ORGS";
+  if      (line.includes("AVOCADO"))                       commodity = "AVOS";
+  else if (line.includes("LEMON"))                         commodity = "LEMS";
+  else if (line.includes("NAARTJ") || line.includes("HAARTJ")) commodity = "NAAR";
+  else if (line.includes("ORANGE"))                        commodity = "ORGS";
   else if (line.includes("CLEMENTINE") || line.includes("CLTM")) commodity = "CLTM";
-  else if (line.includes("KIWI"))    commodity = "KIWI";
-  else if (line.includes("STRAWB"))  commodity = "STRS";
-  else if (line.includes("FIG"))     commodity = "FIGS";
-  else if (line.includes("GUAVA"))   commodity = "GVS";
-  else if (line.includes("DRAGON"))  commodity = "DRAG";
-  else if (line.includes("SATSUM"))  commodity = "NAAR";
-
-  // variety: AF, AH, AK, MA, LR, HM, NV, M1 …
+  else if (line.includes("KIWI"))                          commodity = "KIWI";
+  else if (line.includes("STRAWB"))                        commodity = "STRS";
+  else if (line.includes("FIG"))                           commodity = "FIGS";
+  else if (line.includes("GUAVA"))                         commodity = "GVS";
+  else if (line.includes("DRAGON"))                        commodity = "DRAG";
+  else if (line.includes("SATSUM"))                        commodity = "NAAR";
   const varMatch = line.match(/\b(AF|AH|AK|MA|LR|HM|NV|M1|AE)\b/);
   if (varMatch) variety = varMatch[1];
-
-  // count: numeric or size codes
   const cntMatch = line.match(/;(\d+|1X{1,3}|[LMSX]+);/);
   if (cntMatch) count = cntMatch[1];
-
   return { commodity, variety, count };
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AFFINITY MODEL BUILDER
-// ─────────────────────────────────────────────────────────────────────────────
+function parseSlip(snippet, filename) {
+  if (!snippet) return [];
+  const rows = [];
+  const buyerMatch = snippet.match(/BUYER:\s*([^\n]+)/);
+  const dateMatch  = snippet.match(/DATE:\s*(\d{2}\/[A-Z]+\/\d{4})/);
+  const buyer      = buyerMatch ? buyerMatch[1].trim().replace(/\\/g,"").replace(/\[|\]/g,"") : "UNKNOWN";
+  const months     = {JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12"};
+  const dp         = dateMatch ? dateMatch[1].match(/(\d{2})\/([A-Z]+)\/(\d{4})/) : null;
+  const date       = dp ? `${dp[1]}/${months[dp[2]]||"05"}/${dp[3]}` : "26/05/2026";
+
+  const blocks = [...snippet.matchAll(/GRN:\s*(\d+)[\s\S]*?SALE\s+([\d,]+)\s*@\s*([\d.]+)/g)];
+  for (const m of blocks) {
+    const grn   = m[1];
+    const qty   = parseInt(m[2].replace(/,/g,"")) || 0;
+    const price = parseFloat(m[3]) || 0;
+    // find commodity line just before this GRN block
+    const grnPos  = snippet.indexOf(`GRN: ${grn}`);
+    const before  = snippet.substring(Math.max(0, grnPos - 200), grnPos + 200);
+    const commMatch = before.match(/\n([A-Z][A-Z ,;:\/*\d]+)\n/);
+    const { commodity, variety, count } = parseCommodityLine(commMatch ? commMatch[1] : "");
+    if (qty > 0) rows.push({ buyer, grn, commodity, variety, count, qty, price, date, src: filename });
+  }
+  return rows;
+}
+
+// ── Affinity model ────────────────────────────────────────────────────────────
 function buildModel(history) {
   const m = {};
   for (const h of history) {
@@ -156,114 +132,80 @@ function buildModel(history) {
   return m;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MAIN SYNC FUNCTION
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Main sync ─────────────────────────────────────────────────────────────────
 async function sync() {
   console.log(`\n[${new Date().toISOString()}] 🔄 Sync started`);
   try {
     initFirebase();
     initDrive();
 
-    // 1. Get already-processed file IDs from Firebase
     const processedSnap = await db.ref("jdw/processedFiles").once("value");
     const processed = processedSnap.val() || {};
 
-    // 2. List all PDFs in the Buyer History folder
     const res = await drive.files.list({
-      q: `parentId = '${BUYER_HISTORY_FOLDER}' and mimeType = 'application/pdf'`,
-      fields: "files(id,name,createdTime,description)",
+      q: `'${BUYER_HISTORY_FOLDER}' in parents and mimeType = 'application/pdf'`,
+      fields: "files(id,name,createdTime)",
       pageSize: 200,
       orderBy: "createdTime desc",
     });
     const files = res.data.files || [];
     console.log(`   Found ${files.length} PDFs in Drive`);
 
-    // 3. Find new files
     const newFiles = files.filter(f => !processed[f.id]);
     console.log(`   ${newFiles.length} new files to process`);
     if (newFiles.length === 0) { console.log("   ✅ Nothing new"); return; }
 
-    // 4. Get existing history from Firebase
     const histSnap = await db.ref("jdw/history").once("value");
     let history = histSnap.val() || [];
     if (!Array.isArray(history)) history = Object.values(history);
 
-    // 5. Parse each new file's snippet (Drive search snippet is already extracted)
-    // We re-fetch the file metadata to get the snippet
     let newRows = [];
     for (const file of newFiles) {
       try {
-        const meta = await drive.files.get({
-          fileId: file.id,
-          fields: "id,name,description",
-          supportsAllDrives: true,
-        });
-        // Drive snippet comes via search; for direct get we use the export
-        // Use the files.export or just re-search for snippet
         const searchRes = await drive.files.list({
           q: `'${BUYER_HISTORY_FOLDER}' in parents and name = '${file.name}'`,
           fields: "files(id,name,contentHints/indexableText)",
-          pageSize: 1,
+          pageSize: 5,
         });
         const snippet = searchRes.data.files?.[0]?.contentHints?.indexableText || "";
         const rows = parseSlip(snippet, file.name);
         newRows = newRows.concat(rows);
         processed[file.id] = new Date().toISOString();
-        console.log(`   ✅ ${file.name} → ${rows.length} rows (${rows[0]?.buyer || "?"})`);
-      } catch (e) {
-        console.warn(`   ⚠️  Could not parse ${file.name}: ${e.message}`);
+        console.log(`   ✅ ${file.name} → ${rows.length} rows (${rows[0]?.buyer || "no buyer found"})`);
+      } catch(e) {
+        console.warn(`   ⚠️  ${file.name}: ${e.message}`);
         processed[file.id] = "error";
       }
     }
 
-    if (newRows.length === 0) {
-      console.log("   No parseable rows found in new files");
-      await db.ref("jdw/processedFiles").set(processed);
-      return;
-    }
-
-    // 6. Merge + deduplicate (by buyer+grn+date)
     const existing = new Set(history.map(h => `${h.buyer}|${h.grn}|${h.date}`));
     const toAdd    = newRows.filter(r => !existing.has(`${r.buyer}|${r.grn}|${r.date}`));
     const updated  = [...history, ...toAdd];
+    const model    = buildModel(updated);
 
-    // 7. Rebuild affinity model
-    const model = buildModel(updated);
-
-    // 8. Push everything to Firebase atomically
     await db.ref("jdw").update({
       history:        updated,
       model:          model,
       processedFiles: processed,
-      lastSync: {
-        ts:       new Date().toISOString(),
-        newRows:  toAdd.length,
-        total:    updated.length,
-        buyers:   Object.keys(model).length,
-      },
+      lastSync: { ts: new Date().toISOString(), newRows: toAdd.length, total: updated.length, buyers: Object.keys(model).length },
     });
 
-    // 9. Log to shared log
     const logSnap = await db.ref("jdw/log").once("value");
     const log = Array.isArray(logSnap.val()) ? logSnap.val() : [];
-    log.push({
-      ts:   new Date().toLocaleTimeString("en-ZA"),
-      user: "AUTO-SYNC",
-      msg:  `📥 ${toAdd.length} new tx from ${newFiles.length} slips · ${updated.length} total · ${Object.keys(model).length} buyers`,
-    });
+    log.push({ ts: new Date().toLocaleTimeString("en-ZA"), user:"AUTO-SYNC", msg:`📥 ${toAdd.length} new tx · ${updated.length} total · ${Object.keys(model).length} buyers` });
     await db.ref("jdw/log").set(log.slice(-100));
 
-    console.log(`   ✅ Pushed ${toAdd.length} new rows | ${updated.length} total | ${Object.keys(model).length} buyers`);
+    console.log(`   ✅ Done — ${toAdd.length} new rows | ${updated.length} total | ${Object.keys(model).length} buyers`);
 
-  } catch (err) {
+  } catch(err) {
     console.error("❌ Sync error:", err.message);
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// START
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Keep-alive ping (prevents Render free tier from sleeping) ─────────────────
+const http = require("http");
+http.createServer((req, res) => res.end("jdw-sync alive")).listen(process.env.PORT || 3000);
+
 console.log(`🚀 jdw-sync starting — polling every ${POLL_MINUTES} min`);
-sync(); // run immediately on start
+sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
