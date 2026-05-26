@@ -242,7 +242,52 @@ async function getSnippet(folderId, filename) {
     fields: "files(id,name,contentHints/indexableText)",
     pageSize: 5,
   });
-  return res.data.files?.[0]?.contentHints?.indexableText || "";
+  const snippet = res.data.files?.[0]?.contentHints?.indexableText || "";
+  if (snippet.length > 0) return snippet;
+  // Fallback: download file and extract text
+  const fileId = res.data.files?.[0]?.id;
+  if (!fileId) return "";
+  return await downloadPdfText(fileId);
+}
+
+async function getSnippetById(fileId) {
+  const res = await drive.files.get({
+    fileId,
+    fields: "contentHints/indexableText",
+  });
+  const snippet = res.data?.contentHints?.indexableText || "";
+  if (snippet.length > 0) return snippet;
+  return await downloadPdfText(fileId);
+}
+
+async function downloadPdfText(fileId) {
+  try {
+    // Export as plain text via Drive export
+    const res = await drive.files.export(
+      { fileId, mimeType: "text/plain" },
+      { responseType: "text" }
+    );
+    return res.data || "";
+  } catch(e) {
+    // Not a Google Doc, try download
+    try {
+      const res = await drive.files.get(
+        { fileId, alt: "media" },
+        { responseType: "arraybuffer" }
+      );
+      // Convert buffer to string and extract readable text
+      const buf = Buffer.from(res.data);
+      // Extract ASCII text from PDF binary
+      const text = buf.toString("latin1");
+      // Pull out readable strings (sequences of printable chars)
+      const readable = text.match(/[ -~
+]{4,}/g) || [];
+      return readable.join("\n");
+    } catch(e2) {
+      console.warn(`   ⚠️  Could not download ${fileId}: ${e2.message}`);
+      return "";
+    }
+  }
 }
 
 // ── STOCK SYNC ───────────────────────────────────────────────────────────────
