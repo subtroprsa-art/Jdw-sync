@@ -262,29 +262,22 @@ async function getSnippetById(fileId) {
 
 async function downloadPdfText(fileId) {
   try {
-    // Export as plain text via Drive export
     const res = await drive.files.export(
       { fileId, mimeType: "text/plain" },
       { responseType: "text" }
     );
     return res.data || "";
   } catch(e) {
-    // Not a Google Doc, try download
     try {
-      const res = await drive.files.get(
+      const res2 = await drive.files.get(
         { fileId, alt: "media" },
         { responseType: "arraybuffer" }
       );
-      // Convert buffer to string and extract readable text
-      const buf = Buffer.from(res.data);
-      // Extract ASCII text from PDF binary
-      const text = buf.toString("latin1");
-      // Pull out readable strings (sequences of printable chars)
-      const readable = text.match(/[ -~
-]{4,}/g) || [];
-      return readable.join("\n");
+      const text = Buffer.from(res2.data).toString("latin1");
+      const lines = text.split("\n").filter(l => l.trim().length > 3);
+      return lines.join("\n");
     } catch(e2) {
-      console.warn(`   ⚠️  Could not download ${fileId}: ${e2.message}`);
+      console.warn("Could not download file " + fileId + ": " + e2.message);
       return "";
     }
   }
