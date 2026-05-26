@@ -178,6 +178,7 @@ function parseStockPdf(snippet, filename) {
     const line = lines[i];
     if (/^\d{8}$/.test(line)) {
       const grn = line;
+      if (results.length === 0) console.log(`   🔬 First GRN ${grn} at line ${i}, prev lines: ${JSON.stringify(lines.slice(Math.max(0,i-3),i+3))}`);
       // Producer = nearest previous non-header non-numeric line
       let producer = "";
       for (let b = i-1; b >= Math.max(0,i-4); b--) {
