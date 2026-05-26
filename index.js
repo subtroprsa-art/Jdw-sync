@@ -147,70 +147,102 @@ function parseStockPdf(snippet, filename) {
   if (!snippet) return [];
   const results = [];
 
-  // Clean and split into token array
-  const clean = snippet.replace(/\\\*/g, "*").replace(/\\\\/g, "").replace(/,\n/g, ",");
-  const tokens = clean.split(/\n+/).map(t => t.trim()).filter(Boolean);
-
-  function extractFLR(raw) {
-    raw = raw.replace(/,/g, "");
-    const m = raw.match(/^0+(\d+)$/);
-    if (m) return parseInt(m[1]);
-    return parseInt(raw) || 0;
-  }
+  // Split into lines, remove empty
+  const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
 
   let i = 0;
-  while (i < tokens.length) {
-    const tok = tokens[i];
-    if (/^\d{8}$/.test(tok)) {
-      const grn      = tok;
-      // Producer is the token BEFORE the GRN
-      const producer  = i > 0 ? tokens[i-1].trim() : "";
-      const commLine = (tokens[i+1] || "").trim();
-      const parts    = commLine.split(",");
-      const commodity = parts[0] || "UNK";
-      const variety   = (parts[2] || "*").replace(/\\/g,"");
-      const count     = (parts[5] || "*").replace(/\\/g,"");
+  while (i < lines.length) {
+    const line = lines[i];
 
+    // GRN: exactly 8 digits
+    if (/^\d{8}$/.test(line)) {
+      const grn      = line;
+      const producer = i > 0 ? lines[i-1] : "";
+      const commLine = lines[i+1] || "";
+
+      // Parse commodity string: AVOS,BG150,AF,2,M,*,*
+      const parts    = commLine.split(",");
+      const commodity = parts[0] ? parts[0].trim() : "UNK";
+      const variety   = parts[2] ? parts[2].trim().replace(/\\/g,"").replace(/\*/g,"*") : "*";
+      const count     = parts[5] ? parts[5].trim().replace(/\\/g,"").replace(/\*/g,"*") : "*";
+
+      // Skip header/footer lines as producers
+      const skipWords = ["SALESMAN","AGENT","PRODUCER","JOHANNESBURG","CONSIGNMENT","Version","Printed","Page","GRN","COMMODITY","REC","SOLD","FLR","SORT","STORE","TRAN","ARRIVE","DATE","SIT","RES"];
+      const isValidProducer = producer.length > 2 && !skipWords.some(w => producer.toUpperCase().includes(w)) && !/^\d/.test(producer);
+
+      // Collect quantity tokens after commodity line
       let j = i + 2;
       let flr = 0;
+      const qtokens = [];
 
-      while (j < tokens.length && j < i + 12) {
-        const t = tokens[j].trim();
-        if (!/^[\d,]+$/.test(t) && !/^0+\d/.test(t)) break;
-        const raw = t.replace(/,/g, "");
-        if (/^0+\d/.test(raw)) {
-          flr = extractFLR(raw);
+      while (j < lines.length && j < i + 10) {
+        const t = lines[j].trim().replace(/,/g,"");
+        if (/^[\d]+$/.test(t) || /^0+\d+$/.test(t)) {
+          qtokens.push(t);
           j++;
+        } else {
           break;
         }
-        j++;
       }
 
-      // Fallback: last plain number before next producer
-      if (flr === 0 && j > i + 2) {
-        const lastRaw = tokens[j-1]?.replace(/,/g,"") || "";
-        if (/^\d+$/.test(lastRaw)) {
-          if (lastRaw.length > 5) {
-            // merged field — take trailing digits
-            const trail = lastRaw.replace(/^0+/, "").slice(-4);
-            flr = parseInt(trail) || 0;
+      // Extract FLR from quantity tokens
+      // Pattern 1: last token has leading zeros → FLR is after the zeros
+      // Pattern 2: three separate tokens REC, SOLD, 00FLR
+      // Pattern 3: two tokens REC, SOLDFZEROS (e.g. "2070003")
+      if (qtokens.length > 0) {
+        const last = qtokens[qtokens.length - 1];
+        const leadZero = last.match(/^(0+)(\d+)$/);
+        if (leadZero) {
+          flr = parseInt(leadZero[2]) || 0;
+        } else if (qtokens.length >= 2) {
+          // last token is plain number - could be FLR directly
+          // but check if it looks like a combined field (long number)
+          const raw = last;
+          if (raw.length > 5) {
+            // combined: take last 1-4 significant digits
+            const stripped = raw.replace(/^0+/, "");
+            // FLR is usually small relative to REC
+            const rec = parseInt(qtokens[0].replace(/,/g,"")) || 1;
+            // Try last 2, 3, 4 digits
+            for (const len of [2,3,4]) {
+              if (raw.length > len) {
+                const candidate = parseInt(raw.slice(-len));
+                if (candidate >= 0 && candidate <= rec) {
+                  flr = candidate;
+                  break;
+                }
+              }
+            }
+            if (flr === 0) flr = parseInt(raw.slice(-3)) || 0;
           } else {
-            flr = parseInt(lastRaw) || 0;
+            flr = parseInt(raw) || 0;
           }
+        } else if (qtokens.length === 1) {
+          flr = parseInt(last) || 0;
         }
       }
 
-      if (flr > 0) {
-        results.push({ grn, producer, commodity, variety, count: count === "*" ? "*" : count, flr, src: filename });
+      if (flr > 0 && commodity !== "UNK" && /^[A-Z]/.test(commodity)) {
+        results.push({
+          grn,
+          producer: isValidProducer ? producer : "",
+          commodity,
+          variety,
+          count,
+          flr,
+          src: filename
+        });
       }
+
       i = j;
     } else {
       i++;
     }
   }
+
+  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename}`);
   return results;
 }
-
 // ── Get today's date string DDMMYYYY ────────────────────────────────────────
 function todayStr() {
   const d = new Date();
