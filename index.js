@@ -282,6 +282,7 @@ async function syncStock() {
     let allStock = [];
     for (const file of todayFiles) {
       const snippet = await getSnippet(STOCK_SCANS_FOLDER, file.name);
+      console.log(`   🔍 snippet(${file.name}): len=${snippet.length} | ${JSON.stringify(snippet.substring(0,200))}`);
       const rows    = parseStockPdf(snippet, file.name);
       allStock = allStock.concat(rows);
       console.log(`   ✅ ${file.name} → ${rows.length} stock lines`);
