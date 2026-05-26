@@ -306,13 +306,8 @@ async function syncStock() {
       return;
     }
 
-    // Check if we already processed today's exact set
-    const stockSnap = await db.ref("jdw/stockDate").once("value");
-    const lastStockDate = stockSnap.val();
-    if (lastStockDate === today && todayFiles.length === (await db.ref("jdw/stockFileCount").once("value")).val()) {
-      console.log(`   ✅ Stock already up to date for ${today}`);
-      return;
-    }
+    // Always reprocess to pick up any parser improvements
+    console.log(`   🔄 Processing stock for ${today}...`);
 
     // Parse all of today's stock PDFs
     let allStock = [];
