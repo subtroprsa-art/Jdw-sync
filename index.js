@@ -163,6 +163,8 @@ function parseStockPdf(snippet, filename) {
     const tok = tokens[i];
     if (/^\d{8}$/.test(tok)) {
       const grn      = tok;
+      // Producer is the token BEFORE the GRN
+      const producer  = i > 0 ? tokens[i-1].trim() : "";
       const commLine = (tokens[i+1] || "").trim();
       const parts    = commLine.split(",");
       const commodity = parts[0] || "UNK";
@@ -199,7 +201,7 @@ function parseStockPdf(snippet, filename) {
       }
 
       if (flr > 0) {
-        results.push({ grn, commodity, variety, count: count === "*" ? "*" : count, flr, src: filename });
+        results.push({ grn, producer, commodity, variety, count: count === "*" ? "*" : count, flr, src: filename });
       }
       i = j;
     } else {
