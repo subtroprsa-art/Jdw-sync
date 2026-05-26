@@ -139,34 +139,73 @@ function parseSlip(snippet, filename) {
 }
 
 // ── Stock take parser ─────────────────────────────────────────────────────────
-// Stock PDF filenames: DDMMYYYYPOT.pdf / DDMMYYYYCDW.pdf / DDMMYYYYRJ.pdf
-// Snippet format per line: GRN COMMODITY FLR
+// Handles the JHB Market CONSIGNMENT STOCK TAKE PDF format.
+// Each entry appears as: Producer\nGRN\nCOMMODITY\nQTY_REC\n[QTY_SOLD]\n[00FLR or merged]
+// FLR is always the last numeric field. Leading-zero blocks encode multiple columns.
 function parseStockPdf(snippet, filename) {
   if (!snippet) return [];
-  const lines = [];
-  // match lines like: 15440606 AVOS,TR040,AF,1,*,12,* 174
-  const blocks = [...snippet.matchAll(/(\d{8})\s+([A-Z,*\d]+)\s+(\d+)\s+(\d+)\s+(\d+)/g)];
-  for (const m of blocks) {
-    const grn       = m[1];
-    const commStr   = m[2];
-    const flr       = parseInt(m[5]) || 0; // last number is FLR
-    const parts     = commStr.split(",");
-    const commodity = parts[0] || "UNK";
-    const pkg       = parts[1] || "*";
-    const variety   = parts[2] || "*";
-    const cls       = parts[3] || "*";
-    const size      = parts[4] || "*";
-    const count     = parts[5] || "*";
-    if (flr > 0) lines.push({ grn, commodity, pkg, variety, cls, size, count, flr, src: filename });
+  const results = [];
+
+  // Clean and split into token array
+  const clean = snippet.replace(/\\\*/g, "*").replace(/\\\\/g, "").replace(/,\n/g, ",");
+  const tokens = clean.split(/\n+/).map(t => t.trim()).filter(Boolean);
+
+  function extractFLR(raw) {
+    raw = raw.replace(/,/g, "");
+    const m = raw.match(/^0+(\d+)$/);
+    if (m) return parseInt(m[1]);
+    return parseInt(raw) || 0;
   }
-  // fallback: simpler FLR pattern
-  if (lines.length === 0) {
-    const simple = [...snippet.matchAll(/(\d{8})[^\n]*\n[^\n]*\n[^\n]*(\d+)\s*$/gm)];
-    for (const m of simple) {
-      lines.push({ grn: m[1], commodity:"AVOS", pkg:"*", variety:"*", cls:"*", size:"*", count:"*", flr: parseInt(m[2])||0, src: filename });
+
+  let i = 0;
+  while (i < tokens.length) {
+    const tok = tokens[i];
+    if (/^\d{8}$/.test(tok)) {
+      const grn      = tok;
+      const commLine = (tokens[i+1] || "").trim();
+      const parts    = commLine.split(",");
+      const commodity = parts[0] || "UNK";
+      const variety   = (parts[2] || "*").replace(/\\/g,"");
+      const count     = (parts[5] || "*").replace(/\\/g,"");
+
+      let j = i + 2;
+      let flr = 0;
+
+      while (j < tokens.length && j < i + 12) {
+        const t = tokens[j].trim();
+        if (!/^[\d,]+$/.test(t) && !/^0+\d/.test(t)) break;
+        const raw = t.replace(/,/g, "");
+        if (/^0+\d/.test(raw)) {
+          flr = extractFLR(raw);
+          j++;
+          break;
+        }
+        j++;
+      }
+
+      // Fallback: last plain number before next producer
+      if (flr === 0 && j > i + 2) {
+        const lastRaw = tokens[j-1]?.replace(/,/g,"") || "";
+        if (/^\d+$/.test(lastRaw)) {
+          if (lastRaw.length > 5) {
+            // merged field — take trailing digits
+            const trail = lastRaw.replace(/^0+/, "").slice(-4);
+            flr = parseInt(trail) || 0;
+          } else {
+            flr = parseInt(lastRaw) || 0;
+          }
+        }
+      }
+
+      if (flr > 0) {
+        results.push({ grn, commodity, variety, count: count === "*" ? "*" : count, flr, src: filename });
+      }
+      i = j;
+    } else {
+      i++;
     }
   }
-  return lines;
+  return results;
 }
 
 // ── Get today's date string DDMMYYYY ────────────────────────────────────────
