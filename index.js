@@ -146,104 +146,85 @@ function parseSlip(snippet, filename) {
 function parseStockPdf(snippet, filename) {
   if (!snippet) return [];
   const results = [];
-
-  // Split into lines, remove empty
   const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+
+  const SKIP = ["CONSIGNMENT","JOHANNESBURG","FRESH PRODUCE","AGENT:","SALESMAN:","Version",
+                "Printed","Page","STOCK TAKE","R S A MARKET","GRN NO","COMMODITY","ARRIVE",
+                "QTY","TRAN","COLD","SORT","SIT","RES","FLR","D/R","REC","SOLD"];
+
+  function extractFLR(combined, rec) {
+    combined = combined.replace(/,/g,"");
+    // Find last group of 2+ zeros then trailing digits
+    const m = combined.match(/0{2,}(\d+)$/);
+    if (m) return parseInt(m[1]) || 0;
+    // Single zero then 2+ digits
+    const m2 = combined.match(/0(\d{2,})$/);
+    if (m2) { const c=parseInt(m2[1]); if(!rec||c<=rec) return c; }
+    // Last few digits vs rec
+    if (combined.length > 4 && rec) {
+      for (const ln of [3,4,2]) {
+        if (combined.length >= ln) {
+          const c = parseInt(combined.slice(-ln).replace(/^0+/,"") || "0");
+          if (c >= 0 && c <= rec) return c;
+        }
+      }
+    }
+    return parseInt(combined) || 0;
+  }
 
   let i = 0;
   while (i < lines.length) {
     const line = lines[i];
-
-    // GRN: exactly 8 digits
     if (/^\d{8}$/.test(line)) {
-      const grn      = line;
-      const producer = i > 0 ? lines[i-1] : "";
-      const commLine = lines[i+1] || "";
+      const grn = line;
+      // Producer = nearest previous non-header non-numeric line
+      let producer = "";
+      for (let b = i-1; b >= Math.max(0,i-4); b--) {
+        const pl = lines[b];
+        if (/^\d/.test(pl) || pl.indexOf(",") > 0) break;
+        if (pl.length > 2 && !SKIP.some(s => pl.toUpperCase().includes(s))) {
+          producer = pl; break;
+        }
+      }
+      // Commodity line
+      const commLine = (lines[i+1] || "").replace(/\\/g,"");
+      const parts = commLine.split(",");
+      const commodity = (parts[0]||"").trim();
+      const variety   = (parts[2]||"*").trim().replace(/\\/g,"");
+      const count     = (parts[5]||"*").trim().replace(/\\/g,"");
 
-      // Parse commodity string: AVOS,BG150,AF,2,M,*,*
-      const parts    = commLine.split(",");
-      const commodity = parts[0] ? parts[0].trim() : "UNK";
-      const variety   = parts[2] ? parts[2].trim().replace(/\\/g,"").replace(/\*/g,"*") : "*";
-      const count     = parts[5] ? parts[5].trim().replace(/\\/g,"").replace(/\*/g,"*") : "*";
+      // Skip invalid
+      if (!commodity || !/^[A-Z]/.test(commodity)) { i++; continue; }
 
-      // Skip header/footer lines as producers
-      const skipWords = ["SALESMAN","AGENT","PRODUCER","JOHANNESBURG","CONSIGNMENT","Version","Printed","Page","GRN","COMMODITY","REC","SOLD","FLR","SORT","STORE","TRAN","ARRIVE","DATE","SIT","RES"];
-      const isValidProducer = producer.length > 2 && !skipWords.some(w => producer.toUpperCase().includes(w)) && !/^\d/.test(producer);
-
-      // Collect quantity tokens after commodity line
-      let j = i + 2;
-      let flr = 0;
+      // Collect qty tokens after commodity
+      let j = i + 2, rec = 0;
       const qtokens = [];
-
-      while (j < lines.length && j < i + 10) {
+      while (j < lines.length && j < i+10) {
         const t = lines[j].trim().replace(/,/g,"");
-        if (/^[\d]+$/.test(t) || /^0+\d+$/.test(t)) {
-          qtokens.push(t);
-          j++;
-        } else {
-          break;
-        }
+        if (/^\d+$/.test(t)) { qtokens.push(t); if(qtokens.length===1) rec=parseInt(t); j++; }
+        else break;
       }
 
-      // Extract FLR from quantity tokens
-      // Pattern 1: last token has leading zeros → FLR is after the zeros
-      // Pattern 2: three separate tokens REC, SOLD, 00FLR
-      // Pattern 3: two tokens REC, SOLDFZEROS (e.g. "2070003")
+      // Extract FLR
+      let flr = 0;
       if (qtokens.length > 0) {
-        const last = qtokens[qtokens.length - 1];
-        const leadZero = last.match(/^(0+)(\d+)$/);
-        if (leadZero) {
-          flr = parseInt(leadZero[2]) || 0;
-        } else if (qtokens.length >= 2) {
-          // last token is plain number - could be FLR directly
-          // but check if it looks like a combined field (long number)
-          const raw = last;
-          if (raw.length > 5) {
-            // combined: take last 1-4 significant digits
-            const stripped = raw.replace(/^0+/, "");
-            // FLR is usually small relative to REC
-            const rec = parseInt(qtokens[0].replace(/,/g,"")) || 1;
-            // Try last 2, 3, 4 digits
-            for (const len of [2,3,4]) {
-              if (raw.length > len) {
-                const candidate = parseInt(raw.slice(-len));
-                if (candidate >= 0 && candidate <= rec) {
-                  flr = candidate;
-                  break;
-                }
-              }
-            }
-            if (flr === 0) flr = parseInt(raw.slice(-3)) || 0;
-          } else {
-            flr = parseInt(raw) || 0;
-          }
-        } else if (qtokens.length === 1) {
+        const last = qtokens[qtokens.length-1];
+        if (qtokens.length === 1) {
           flr = parseInt(last) || 0;
+        } else {
+          flr = extractFLR(last, rec);
         }
       }
 
-      if (flr > 0 && commodity !== "UNK" && /^[A-Z]/.test(commodity)) {
-        results.push({
-          grn,
-          producer: isValidProducer ? producer : "",
-          commodity,
-          variety,
-          count,
-          flr,
-          src: filename
-        });
+      if (flr > 0) {
+        results.push({ grn, producer, commodity, variety, count, flr, src: filename });
       }
-
       i = j;
-    } else {
-      i++;
-    }
+    } else { i++; }
   }
-
   console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename}`);
   return results;
-}
-// ── Get today's date string DDMMYYYY ────────────────────────────────────────
+}// ── Get today's date string DDMMYYYY ────────────────────────────────────────
 function todayStr() {
   const d = new Date();
   const dd = String(d.getDate()).padStart(2,"0");
