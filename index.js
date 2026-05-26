@@ -1,115 +1,74 @@
-/**
- * jdw-sync
- * Watches the JHB Market Buyer History folder in Google Drive.
- * Every 5 minutes it reads any new sale slip PDFs, parses them,
- * and pushes the updated history + rebuilt affinity model to Firebase.
- */
-
 const { google }  = require("googleapis");
 const admin       = require("firebase-admin");
 const cron        = require("node-cron");
+const http        = require("http");
 
 const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
 const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
 const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
 
-// ── Robust JSON parser (handles mobile copy-paste issues) ────────────────────
+const SEED_HISTORY = [
+  { buyer:"MANDELA MARKET",       grn:"15379866", commodity:"AVOS", variety:"AK", count:"8",  qty:30,  price:50,  date:"26/05/2026" },
+  { buyer:"MANDELA MARKET",       grn:"15379857", commodity:"AVOS", variety:"AK", count:"10", qty:10,  price:50,  date:"26/05/2026" },
+  { buyer:"MANDELA MARKET",       grn:"15379869", commodity:"AVOS", variety:"AK", count:"16", qty:120, price:50,  date:"26/05/2026" },
+  { buyer:"MANDELA MARKET",       grn:"15444973", commodity:"AVOS", variety:"MA", count:"22", qty:164, price:70,  date:"26/05/2026" },
+  { buyer:"DAY DREAMERS",         grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:60,  price:120, date:"26/05/2026" },
+  { buyer:"DAY DREAMERS",         grn:"15428753", commodity:"KIWI", variety:"*",  count:"20", qty:2,   price:200, date:"26/05/2026" },
+  { buyer:"SUNNINGHILL SUPER SP", grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:25,  price:120, date:"26/05/2026" },
+  { buyer:"DE AGUIAR HELIO GOME", grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:30,  price:120, date:"26/05/2026" },
+  { buyer:"PAULS FRUIT & VEG",    grn:"15416268", commodity:"LEMS", variety:"*",  count:"88", qty:2,   price:120, date:"26/05/2026" },
+  { buyer:"PAULS FRUIT & VEG",    grn:"15428726", commodity:"NAAR", variety:"HM", count:"12", qty:5,   price:14,  date:"26/05/2026" },
+  { buyer:"PAULS FRUIT & VEG",    grn:"15415663", commodity:"KIWI", variety:"*",  count:"20", qty:5,   price:160, date:"26/05/2026" },
+  { buyer:"PAULS FRUIT & VEG",    grn:"15444988", commodity:"AVOS", variety:"AH", count:"*",  qty:5,   price:162, date:"26/05/2026" },
+  { buyer:"WOMEGO SEYUM NUNO",    grn:"15429348", commodity:"NAAR", variety:"LR", count:"1X", qty:30,  price:70,  date:"26/05/2026" },
+  { buyer:"GEBREYSUS KERIGA TEK", grn:"15397488", commodity:"AVOS", variety:"AH", count:"14", qty:84,  price:70,  date:"26/05/2026" },
+  { buyer:"GEBREYSUS KERIGA TEK", grn:"15444973", commodity:"AVOS", variety:"MA", count:"22", qty:16,  price:70,  date:"26/05/2026" },
+  { buyer:"FLM SA (PTY) LTD",     grn:"15444723", commodity:"STRS", variety:"*",  count:"16", qty:182, price:608, date:"26/05/2026" },
+  { buyer:"FLM SA (PTY) LTD",     grn:"15397488", commodity:"AVOS", variety:"AH", count:"14", qty:264, price:70,  date:"26/05/2026" },
+  { buyer:"FLM SA (PTY) LTD",     grn:"15442214", commodity:"KIWI", variety:"*",  count:"20", qty:75,  price:240, date:"26/05/2026" },
+  { buyer:"MUHACHA ABENITO JOAO", grn:"15444723", commodity:"STRS", variety:"*",  count:"16", qty:40,  price:640, date:"26/05/2026" },
+  { buyer:"ABDUCT RATE TRADE",    grn:"15442214", commodity:"KIWI", variety:"*",  count:"20", qty:20,  price:200, date:"26/05/2026" },
+  { buyer:"WELKOM MINI MARKET",   grn:"15415663", commodity:"KIWI", variety:"*",  count:"20", qty:37,  price:128, date:"26/05/2026" },
+  { buyer:"FERREIRA TYRONE",      grn:"15444973", commodity:"AVOS", variety:"MA", count:"22", qty:8,   price:80,  date:"26/05/2026" },
+  { buyer:"PIONEER FRESH",        grn:"15429339", commodity:"AVOS", variety:"AF", count:"14", qty:20,  price:100, date:"26/05/2026" },
+  { buyer:"AFRICAN FRUIT CO",     grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:30,  price:100, date:"26/05/2026" },
+  { buyer:"ALI ENDRIS",           grn:"15442587", commodity:"AVOS", variety:"AH", count:"20", qty:166, price:60,  date:"26/05/2026" },
+  { buyer:"MUSTAFA AGMAT",        grn:"15421261", commodity:"NAAR", variety:"LR", count:"1X", qty:104, price:60,  date:"26/05/2026" },
+  { buyer:"RANDGATE SPAR",        grn:"15429339", commodity:"AVOS", variety:"AF", count:"14", qty:10,  price:110, date:"26/05/2026" },
+  { buyer:"PETER PAMA",           grn:"15415073", commodity:"AVOS", variety:"AF", count:"16", qty:10,  price:120, date:"26/05/2026" },
+  { buyer:"ARGYROU SAVEWAYS",     grn:"15428726", commodity:"NAAR", variety:"HM", count:"12", qty:36,  price:10,  date:"26/05/2026" },
+  { buyer:"KATOMPA MWAMBA",       grn:"15428721", commodity:"NAAR", variety:"HM", count:"15", qty:400, price:10,  date:"26/05/2026" },
+  { buyer:"GARDENFRESH",          grn:"15442235", commodity:"FIGS", variety:"*",  count:"20", qty:5,   price:200, date:"26/05/2026" },
+  { buyer:"SIBIYA SAM",           grn:"15387810", commodity:"AVOS", variety:"MA", count:"14", qty:26,  price:60,  date:"05/05/2026" },
+  { buyer:"MM FOODS",             grn:"15373522", commodity:"FIGS", variety:"*",  count:"30", qty:5,   price:240, date:"05/05/2026" },
+  { buyer:"PICK N PAY BRACKENH",  grn:"15401127", commodity:"KIWI", variety:"*",  count:"8",  qty:25,  price:160, date:"05/05/2026" },
+  { buyer:"D PARBOO AND SON",     grn:"15394527", commodity:"AVOS", variety:"AF", count:"10", qty:10,  price:110, date:"05/05/2026" },
+  { buyer:"RIVERSIDE FRESH",      grn:"15391663", commodity:"AVOS", variety:"AH", count:"16", qty:50,  price:80,  date:"05/05/2026" },
+  { buyer:"RIVERSIDE FRESH",      grn:"15391658", commodity:"AVOS", variety:"AH", count:"14", qty:50,  price:80,  date:"05/05/2026" },
+  { buyer:"RIVERSIDE FRESH",      grn:"15340998", commodity:"AVOS", variety:"AH", count:"20", qty:20,  price:70,  date:"05/05/2026" },
+  { buyer:"TROPICAPE FRUIT PACK", grn:"15400623", commodity:"STRS", variety:"*",  count:"16", qty:20,  price:640, date:"05/05/2026" },
+  { buyer:"FLM SA (PTY) LTD",     grn:"15398683", commodity:"DRAG", variety:"*",  count:"10", qty:160, price:160, date:"05/05/2026" },
+  { buyer:"FLM SA (PTY) LTD",     grn:"15403543", commodity:"GVS",  variety:"*",  count:"L",  qty:200, price:50,  date:"05/05/2026" },
+  { buyer:"ZAMAN MD OHEDUZ",      grn:"15400098", commodity:"LEMS", variety:"*",  count:"56", qty:10,  price:140, date:"05/05/2026" },
+  { buyer:"SIESTA (PTY) LTD",     grn:"15391736", commodity:"FIGS", variety:"*",  count:"30", qty:2,   price:300, date:"05/05/2026" },
+  { buyer:"GO FRESH HOSPITALITY", grn:"15400623", commodity:"STRS", variety:"*",  count:"16", qty:8,   price:640, date:"05/05/2026" },
+  { buyer:"MAZIVILA LUIS RAUL",   grn:"15377048", commodity:"FIGS", variety:"*",  count:"20", qty:1,   price:300, date:"05/05/2026" },
+];
+
 function parseJSON(envVar, name) {
   try {
     let raw = (process.env[envVar] || "").trim();
-    // remove any stray line breaks outside of string values
-    // fix private_key escaped newlines
     raw = raw.replace(/\\\\n/g, "\\n");
     const obj = JSON.parse(raw);
-    // ensure private_key has real newlines
-    if (obj.private_key) {
-      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-    }
+    if (obj.private_key) obj.private_key = obj.private_key.replace(/\\n/g, "\n");
     console.log(`✅ Parsed ${name}`);
     return obj;
   } catch(e) {
     console.error(`❌ Could not parse ${name}: ${e.message}`);
-    console.error(`   First 100 chars: ${(process.env[envVar]||"").substring(0,100)}`);
     throw e;
   }
 }
 
-// ── Firebase ─────────────────────────────────────────────────────────────────
-let db;
-function initFirebase() {
-  if (db) return;
-  const serviceAccount = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
-  if (!admin.apps.length) {
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount),
-      databaseURL: FIREBASE_DB_URL,
-    });
-  }
-  db = admin.database();
-  console.log("✅ Firebase connected to", FIREBASE_DB_URL);
-}
-
-// ── Google Drive ─────────────────────────────────────────────────────────────
-let drive;
-function initDrive() {
-  if (drive) return;
-  const credentials = parseJSON("GOOGLE_SERVICE_ACCOUNT", "Google credentials");
-  const auth = new google.auth.GoogleAuth({
-    credentials,
-    scopes: ["https://www.googleapis.com/auth/drive.readonly"],
-  });
-  drive = google.drive({ version: "v3", auth });
-  console.log("✅ Google Drive connected");
-}
-
-// ── Slip parser ───────────────────────────────────────────────────────────────
-function parseCommodityLine(line) {
-  line = (line || "").toUpperCase();
-  let commodity = "UNK", variety = "*", count = "*";
-  if      (line.includes("AVOCADO"))                       commodity = "AVOS";
-  else if (line.includes("LEMON"))                         commodity = "LEMS";
-  else if (line.includes("NAARTJ") || line.includes("HAARTJ")) commodity = "NAAR";
-  else if (line.includes("ORANGE"))                        commodity = "ORGS";
-  else if (line.includes("CLEMENTINE") || line.includes("CLTM")) commodity = "CLTM";
-  else if (line.includes("KIWI"))                          commodity = "KIWI";
-  else if (line.includes("STRAWB"))                        commodity = "STRS";
-  else if (line.includes("FIG"))                           commodity = "FIGS";
-  else if (line.includes("GUAVA"))                         commodity = "GVS";
-  else if (line.includes("DRAGON"))                        commodity = "DRAG";
-  else if (line.includes("SATSUM"))                        commodity = "NAAR";
-  const varMatch = line.match(/\b(AF|AH|AK|MA|LR|HM|NV|M1|AE)\b/);
-  if (varMatch) variety = varMatch[1];
-  const cntMatch = line.match(/;(\d+|1X{1,3}|[LMSX]+);/);
-  if (cntMatch) count = cntMatch[1];
-  return { commodity, variety, count };
-}
-
-function parseSlip(snippet, filename) {
-  if (!snippet) return [];
-  const rows = [];
-  const buyerMatch = snippet.match(/BUYER:\s*([^\n]+)/);
-  const dateMatch  = snippet.match(/DATE:\s*(\d{2}\/[A-Z]+\/\d{4})/);
-  const buyer      = buyerMatch ? buyerMatch[1].trim().replace(/\\/g,"").replace(/\[|\]/g,"") : "UNKNOWN";
-  const months     = {JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12"};
-  const dp         = dateMatch ? dateMatch[1].match(/(\d{2})\/([A-Z]+)\/(\d{4})/) : null;
-  const date       = dp ? `${dp[1]}/${months[dp[2]]||"05"}/${dp[3]}` : "26/05/2026";
-
-  const blocks = [...snippet.matchAll(/GRN:\s*(\d+)[\s\S]*?SALE\s+([\d,]+)\s*@\s*([\d.]+)/g)];
-  for (const m of blocks) {
-    const grn   = m[1];
-    const qty   = parseInt(m[2].replace(/,/g,"")) || 0;
-    const price = parseFloat(m[3]) || 0;
-    // find commodity line just before this GRN block
-    const grnPos  = snippet.indexOf(`GRN: ${grn}`);
-    const before  = snippet.substring(Math.max(0, grnPos - 200), grnPos + 200);
-    const commMatch = before.match(/\n([A-Z][A-Z ,;:\/*\d]+)\n/);
-    const { commodity, variety, count } = parseCommodityLine(commMatch ? commMatch[1] : "");
-    if (qty > 0) rows.push({ buyer, grn, commodity, variety, count, qty, price, date, src: filename });
-  }
-  return rows;
-}
-
-// ── Affinity model ────────────────────────────────────────────────────────────
 function buildModel(history) {
   const m = {};
   for (const h of history) {
@@ -132,13 +91,88 @@ function buildModel(history) {
   return m;
 }
 
-// ── Main sync ─────────────────────────────────────────────────────────────────
+function parseCommodityLine(line) {
+  line = (line || "").toUpperCase();
+  let commodity = "UNK", variety = "*", count = "*";
+  if      (line.includes("AVOCADO"))  commodity = "AVOS";
+  else if (line.includes("LEMON"))    commodity = "LEMS";
+  else if (line.includes("NAARTJ") || line.includes("HAARTJ")) commodity = "NAAR";
+  else if (line.includes("ORANGE"))   commodity = "ORGS";
+  else if (line.includes("KIWI"))     commodity = "KIWI";
+  else if (line.includes("STRAWB"))   commodity = "STRS";
+  else if (line.includes("FIG"))      commodity = "FIGS";
+  else if (line.includes("GUAVA"))    commodity = "GVS";
+  else if (line.includes("DRAGON"))   commodity = "DRAG";
+  else if (line.includes("SATSUM"))   commodity = "NAAR";
+  const varMatch = line.match(/\b(AF|AH|AK|MA|LR|HM|NV|M1|AE)\b/);
+  if (varMatch) variety = varMatch[1];
+  const cntMatch = line.match(/;(\d+|1X{1,3}|[LMSX]+);/);
+  if (cntMatch) count = cntMatch[1];
+  return { commodity, variety, count };
+}
+
+function parseSlip(snippet, filename) {
+  if (!snippet) return [];
+  const rows = [];
+  const buyerMatch = snippet.match(/BUYER:\s*([^\n]+)/);
+  const dateMatch  = snippet.match(/DATE:\s*(\d{2}\/[A-Z]+\/\d{4})/);
+  const buyer  = buyerMatch ? buyerMatch[1].trim().replace(/\\/g,"").replace(/\[|\]/g,"") : "UNKNOWN";
+  const months = {JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12"};
+  const dp     = dateMatch ? dateMatch[1].match(/(\d{2})\/([A-Z]+)\/(\d{4})/) : null;
+  const date   = dp ? `${dp[1]}/${months[dp[2]]||"05"}/${dp[3]}` : "26/05/2026";
+  const blocks = [...snippet.matchAll(/GRN:\s*(\d+)[\s\S]*?SALE\s+([\d,]+)\s*@\s*([\d.]+)/g)];
+  for (const m of blocks) {
+    const grn   = m[1];
+    const qty   = parseInt(m[2].replace(/,/g,"")) || 0;
+    const price = parseFloat(m[3]) || 0;
+    const grnPos = snippet.indexOf(`GRN: ${grn}`);
+    const around = snippet.substring(Math.max(0,grnPos-200), grnPos+200);
+    const commMatch = around.match(/\n([A-Z][A-Z ,;:\/*\d]+)\n/);
+    const { commodity, variety, count } = parseCommodityLine(commMatch ? commMatch[1] : "");
+    if (qty > 0) rows.push({ buyer, grn, commodity, variety, count, qty, price, date, src: filename });
+  }
+  return rows;
+}
+
+let db;
+function initFirebase() {
+  if (db) return;
+  const sa = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
+  if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(sa), databaseURL: FIREBASE_DB_URL });
+  db = admin.database();
+  console.log("✅ Firebase connected to", FIREBASE_DB_URL);
+}
+
+let drive;
+function initDrive() {
+  if (drive) return;
+  const creds = parseJSON("GOOGLE_SERVICE_ACCOUNT", "Google credentials");
+  const auth  = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/drive.readonly"] });
+  drive = google.drive({ version: "v3", auth });
+  console.log("✅ Google Drive connected");
+}
+
 async function sync() {
   console.log(`\n[${new Date().toISOString()}] 🔄 Sync started`);
   try {
     initFirebase();
     initDrive();
 
+    // Seed if empty
+    const histSnap = await db.ref("jdw/history").once("value");
+    let history = histSnap.val();
+    if (!history || (Array.isArray(history) && history.length === 0)) {
+      console.log("   📦 No history found — seeding with base data...");
+      history = SEED_HISTORY;
+      const model = buildModel(history);
+      await db.ref("jdw").update({ history, model, lastSync: { ts: new Date().toISOString(), newRows: history.length, total: history.length, buyers: Object.keys(model).length } });
+      console.log(`   ✅ Seeded ${history.length} transactions, ${Object.keys(model).length} buyers`);
+    } else {
+      if (!Array.isArray(history)) history = Object.values(history);
+      console.log(`   📚 Found ${history.length} existing transactions`);
+    }
+
+    // Check for new Drive files
     const processedSnap = await db.ref("jdw/processedFiles").once("value");
     const processed = processedSnap.val() || {};
 
@@ -149,15 +183,10 @@ async function sync() {
       orderBy: "createdTime desc",
     });
     const files = res.data.files || [];
-    console.log(`   Found ${files.length} PDFs in Drive`);
-
     const newFiles = files.filter(f => !processed[f.id]);
-    console.log(`   ${newFiles.length} new files to process`);
-    if (newFiles.length === 0) { console.log("   ✅ Nothing new"); return; }
+    console.log(`   📂 ${files.length} PDFs in Drive, ${newFiles.length} new`);
 
-    const histSnap = await db.ref("jdw/history").once("value");
-    let history = histSnap.val() || [];
-    if (!Array.isArray(history)) history = Object.values(history);
+    if (newFiles.length === 0) { console.log("   ✅ Nothing new"); return; }
 
     let newRows = [];
     for (const file of newFiles) {
@@ -171,7 +200,7 @@ async function sync() {
         const rows = parseSlip(snippet, file.name);
         newRows = newRows.concat(rows);
         processed[file.id] = new Date().toISOString();
-        console.log(`   ✅ ${file.name} → ${rows.length} rows (${rows[0]?.buyer || "no buyer found"})`);
+        console.log(`   ✅ ${file.name} → ${rows.length} rows (${rows[0]?.buyer || "?"})`);
       } catch(e) {
         console.warn(`   ⚠️  ${file.name}: ${e.message}`);
         processed[file.id] = "error";
@@ -184,9 +213,7 @@ async function sync() {
     const model    = buildModel(updated);
 
     await db.ref("jdw").update({
-      history:        updated,
-      model:          model,
-      processedFiles: processed,
+      history, model, processedFiles: processed,
       lastSync: { ts: new Date().toISOString(), newRows: toAdd.length, total: updated.length, buyers: Object.keys(model).length },
     });
 
@@ -196,16 +223,12 @@ async function sync() {
     await db.ref("jdw/log").set(log.slice(-100));
 
     console.log(`   ✅ Done — ${toAdd.length} new rows | ${updated.length} total | ${Object.keys(model).length} buyers`);
-
   } catch(err) {
     console.error("❌ Sync error:", err.message);
   }
 }
 
-// ── Keep-alive ping (prevents Render free tier from sleeping) ─────────────────
-const http = require("http");
 http.createServer((req, res) => res.end("jdw-sync alive")).listen(process.env.PORT || 3000);
-
 console.log(`🚀 jdw-sync starting — polling every ${POLL_MINUTES} min`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
