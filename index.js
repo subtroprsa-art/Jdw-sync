@@ -264,7 +264,7 @@ function parseStockPdf(snippet, filename, today) {
     }
   }
 
-  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename} (grns:${grns.length} dates:${dates.length})`);
+  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename} (grns:${grns.length} comms:${comms.length} dates:${dates.length})`); if(dates.length===0) { const sampleDates = lines.filter(l=>/^\d{2}\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/\d{4}$/i.test(l)); console.log(`   🔍 Raw dates found in text: ${sampleDates.length} | sample: ${JSON.stringify(sampleDates.slice(0,3))}`); }
   if (results.length > 0) {
     const oldest = results.reduce((a,b) => (b.age||0) > (a.age||0) ? b : a);
     console.log(`   📅 Oldest: ${oldest.producer} ${oldest.commodity} arrived ${oldest.arriveDate} (${oldest.age}d)`);
