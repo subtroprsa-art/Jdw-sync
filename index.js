@@ -143,7 +143,7 @@ function parseSlip(snippet, filename) {
 // Handles the JHB Market CONSIGNMENT STOCK TAKE PDF format.
 // Each entry appears as: Producer\nGRN\nCOMMODITY\nQTY_REC\n[QTY_SOLD]\n[00FLR or merged]
 // FLR is always the last numeric field. Leading-zero blocks encode multiple columns.
-function parseStockPdf(snippet, filename) {
+function parseStockPdf(snippet, filename, today) {
   if (!snippet) return [];
   const results = [];
   const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
@@ -256,7 +256,7 @@ function parseStockPdf(snippet, filename) {
     }
 
     if (flr > 0 && commodity && /^[A-Z]/.test(commodity)) {
-      results.push({ grn, producer, commodity, variety, count, flr, src: filename });
+      results.push({ grn, producer, commodity, variety, count, flr, src: filename, stockDate: today });
     }
   }
 
@@ -368,7 +368,7 @@ async function syncStock() {
     for (const file of todayFiles) {
       const snippet = await getSnippet(STOCK_SCANS_FOLDER, file.name);
       console.log(`   🔍 snippet(${file.name}): len=${snippet.length} | ${JSON.stringify(snippet.substring(0,200))}`);
-      const rows    = parseStockPdf(snippet, file.name);
+      const rows    = parseStockPdf(snippet, file.name, today);
       allStock = allStock.concat(rows);
       console.log(`   ✅ ${file.name} → ${rows.length} stock lines`);
     }
