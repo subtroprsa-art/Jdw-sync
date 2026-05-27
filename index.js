@@ -274,6 +274,15 @@ function parseStockPdf(snippet, filename, today) {
   }
   return results;
 }
+let db;
+function initFirebase() {
+  if (db) return;
+  const sa = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
+  if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(sa), databaseURL: FIREBASE_DB_URL });
+  db = admin.database();
+  console.log("✅ Firebase connected");
+}
+
 let drive;
 function initDrive() {
   if (drive) return;
