@@ -145,134 +145,135 @@ function parseSlip(snippet, filename) {
 // FLR is always the last numeric field. Leading-zero blocks encode multiple columns.
 function parseStockPdf(snippet, filename, today) {
   if (!snippet) return [];
-  const results = [];
-  const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
 
-  // pdf-parse reads columns left to right across the page
-  // Layout: [all producers] [all GRNs] [all commodities] [all qtys]
-  // We collect each type and zip them together
+  const MONTHS = {JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',
+                  JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12'};
 
-  const grns = [];
-  const commodities = [];
-  const producers = {};  // index -> producer name
-
-  // First pass: find all GRNs and their indices
-  const grnIndices = [];
-  lines.forEach((line, idx) => {
-    if (/^\d{8}$/.test(line)) {
-      grns.push(line);
-      grnIndices.push(idx);
-    }
-  });
-
-  if (grns.length === 0) return [];
-
-  // Find commodity strings (contain commas and start with letters)
-  const commLines = [];
-  lines.forEach((line, idx) => {
-    if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(line)) {
-      commLines.push({ idx, line });
-    }
-  });
-
-  // The GRNs and commodities should be in the same order
-  // Match them by position: first N commodities match first N GRNs
-  const minLen = Math.min(grns.length, commLines.length);
-
-  // For each GRN, find producer (the non-numeric, non-header line just before the GRN block starts)
-  // GRNs are consecutive - find where the GRN block starts
-  const firstGrnIdx = grnIndices[0];
-  
-  // Producers appear before GRNs in groups
-  // Look for producer names between the start and the GRN block
-  // Actually from logs: producers appear BEFORE the whole GRN block
-  // They are consecutive just like GRNs
-  // Count: same number as GRNs
-  
-  // Find producer block: consecutive non-numeric, non-header lines just before GRNs
-  const SKIP_WORDS = ['CONSIGNMENT','JOHANNESBURG','AGENT:','SALESMAN:','Version','Printed',
-                       'Page','STOCK','R S A','GRN','COMMODITY','ARRIVE','COLD','SORT','SIT','RES',
-                       'TRAN','D/R','QTY','FLR','REC','SOLD','MARKET','PRODUCE','FRESH'];
-  
-  const producerLines = [];
-  for (let i = firstGrnIdx - 1; i >= 0; i--) {
-    const l = lines[i];
-    if (/^\d/.test(l) || l.indexOf(',') > 0) break;
-    if (l.length > 2 && !SKIP_WORDS.some(s => l.toUpperCase().includes(s))) {
-      producerLines.unshift(l);
-    }
-  }
-
-  // Collect quantity blocks after commodities
-  // Each GRN has: REC, then a combined sold+flr number
-  // Find number blocks after the last commodity
-  const lastCommIdx = commLines.length > 0 ? commLines[commLines.length-1].idx : 0;
-  
-  const allNums = [];
-  for (let i = lastCommIdx + 1; i < lines.length; i++) {
-    const t = lines[i].replace(/,/g,'');
-    if (/^\d+$/.test(t)) allNums.push(t);
-  }
+  const SKIP = ["CONSIGNMENT","JOHANNESBURG","AGENT:","SALESMAN:","Version","Printed",
+                "Page","STOCK","R S A","GRN","COMMODITY","ARRIVE","COLD","SORT","SIT",
+                "RES","TRAN","D/R","QTY","FLR","REC","SOLD","MARKET","PRODUCE","FRESH","STORE"];
 
   function extractFLR(combined, rec) {
     combined = String(combined).replace(/,/g,'');
     const m = combined.match(/0{2,}(\d+)$/);
     if (m) return parseInt(m[1]) || 0;
     const m2 = combined.match(/0(\d{2,})$/);
-    if (m2) { const c=parseInt(m2[1]); if(!rec||c<=rec) return c; }
+    if (m2) { const c = parseInt(m2[1]); if (!rec || c <= rec) return c; }
     if (combined.length > 4 && rec) {
       for (const ln of [3,4,2]) {
         if (combined.length >= ln) {
           const c = parseInt(combined.slice(-ln).replace(/^0+/,'') || '0');
-          if (c>=0 && c<=rec) return c;
+          if (c >= 0 && c <= rec) return c;
         }
       }
     }
     return parseInt(combined) || 0;
   }
 
-  // Each stock line uses 2 numbers: REC and SOLD+FLR combined (or 3: REC, SOLD, FLR)
-  // Try to pair numbers with GRNs
-  let numIdx = 0;
-  for (let i = 0; i < minLen; i++) {
-    const grn = grns[i];
-    const commLine = commLines[i].line.replace(/\\/g,'');
-    const parts = commLine.split(',');
-    const commodity = parts[0] || 'UNK';
-    const variety   = (parts[2] || '*').replace(/[\\]/g, '').trim();
-    const count     = (parts[5] || '*').replace(/[\\]/g, '').trim();
-    const producer  = producerLines[i] || '';
+  function calcAge(dateStr) {
+    if (!dateStr) return null;
+    try {
+      const p = dateStr.split('/');
+      const d = new Date(parseInt(p[2]), parseInt(p[1])-1, parseInt(p[0]));
+      return Math.floor((Date.now() - d.getTime()) / 86400000);
+    } catch { return null; }
+  }
 
-    // Get qty numbers for this entry
-    const rec = parseInt((allNums[numIdx] || '0').replace(/,/g,'')) || 0;
-    numIdx++;
+  // ── Split into pages on "Printed on..." ──────────────────────────────────
+  const rawLines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+  
+  // Build page blocks: each block = lines up to next "Printed on", then dates after
+  const pageBlocks = [];
+  let currentLines = [], inDates = false, currentDates = [];
+
+  for (const line of rawLines) {
+    if (/^Printed on/.test(line)) {
+      inDates = true;
+      continue;
+    }
+    if (inDates) {
+      const dm = line.match(/^(\d{2})\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/(\d{4})$/i);
+      if (dm) {
+        currentDates.push(`${dm[1]}/${MONTHS[dm[2].toUpperCase()]}/${dm[3]}`);
+      } else if (/^0{10,}$/.test(line) || /^JOHANNESBURG/.test(line) || /^CONSIGNMENT/.test(line)) {
+        // End of date block
+        pageBlocks.push({ lines: currentLines, dates: currentDates });
+        currentLines = []; currentDates = []; inDates = false;
+        if (/^JOHANNESBURG/.test(line) || /^CONSIGNMENT/.test(line)) currentLines.push(line);
+      }
+    } else {
+      currentLines.push(line);
+    }
+  }
+  if (currentLines.length > 0) pageBlocks.push({ lines: currentLines, dates: currentDates });
+
+  // ── Process each page block ───────────────────────────────────────────────
+  const results = [];
+
+  for (const page of pageBlocks) {
+    const { lines, dates } = page;
     
-    let flr = 0;
-    // Check if next number(s) form the FLR
-    if (numIdx < allNums.length) {
-      const next = allNums[numIdx];
-      flr = extractFLR(next, rec);
-      numIdx++;
+    // Collect GRNs in order
+    const grns = [], grnIdx = [];
+    lines.forEach((l, i) => { if (/^\d{8}$/.test(l)) { grns.push(l); grnIdx.push(i); } });
+    if (grns.length === 0) continue;
+
+    // Collect commodity strings in order
+    const comms = [];
+    lines.forEach(l => { if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(l)) comms.push(l); });
+
+    // Find producers: line before each GRN index
+    const producers = grns.map((_, gi) => {
+      const idx = grnIdx[gi];
+      for (let b = idx - 1; b >= Math.max(0, idx - 4); b--) {
+        const pl = lines[b];
+        if (!pl || /^\d/.test(pl) || pl.indexOf(',') > 0) break;
+        if (pl.length > 2 && !SKIP.some(s => pl.toUpperCase().includes(s))) return pl;
+      }
+      return '';
+    });
+
+    // Collect qty numbers after last commodity
+    const lastCommPos = lines.reduce((acc, l, i) => /^[A-Z]{2,5},[A-Z0-9]+,/.test(l) ? i : acc, 0);
+    const nums = [];
+    for (let i = lastCommPos + 1; i < lines.length; i++) {
+      const t = lines[i].replace(/,/g,'');
+      if (/^\d+$/.test(t)) nums.push(t);
     }
 
-    if (flr > 0 && commodity && /^[A-Z]/.test(commodity)) {
-      results.push({ grn, producer, commodity, variety, count, flr, src: filename, stockDate: today });
+    const minLen = Math.min(grns.length, comms.length);
+    let nIdx = 0;
+
+    for (let i = 0; i < minLen; i++) {
+      const grn        = grns[i];
+      const commLine   = comms[i].replace(/[\\]/g,'').trim();
+      const parts      = commLine.split(',');
+      const commodity  = parts[0] || 'UNK';
+      const variety    = (parts[2] || '*').trim();
+      const count      = (parts[5] || '*').trim();
+      const producer   = producers[i] || '';
+      const arriveDate = dates[i] || null;   // ← per-line arrival date
+      const age        = calcAge(arriveDate);
+
+      const rec = parseInt((nums[nIdx] || '0').replace(/,/g,'')) || 0;
+      nIdx++;
+      let flr = 0;
+      if (nIdx < nums.length) { flr = extractFLR(nums[nIdx], rec); nIdx++; }
+
+      if (flr > 0 && commodity && /^[A-Z]/.test(commodity)) {
+        results.push({ grn, producer, commodity, variety, count, flr,
+                       arriveDate, age, stockDate: today, src: filename });
+      }
     }
   }
 
-  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename} (grns:${grns.length} comms:${commLines.length})`);
+  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename}`);
+  if (results.length > 0) {
+    const oldest = results.reduce((a,b) => (b.age||0) > (a.age||0) ? b : a);
+    console.log(`   📅 Oldest: ${oldest.producer} ${oldest.commodity} → ${oldest.arriveDate} (${oldest.age}d)`);
+  }
   return results;
 }
-// ── Firebase & Drive init ────────────────────────────────────────────────────
-let db;
-function initFirebase() {
-  if (db) return;
-  const sa = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
-  if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(sa), databaseURL: FIREBASE_DB_URL });
-  db = admin.database();
-  console.log("✅ Firebase connected");
-}
-
 let drive;
 function initDrive() {
   if (drive) return;
