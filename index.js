@@ -178,46 +178,38 @@ function parseStockPdf(snippet, filename, today) {
     } catch { return null; }
   }
 
-  const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
-
-  // ── Pass 1: collect GRNs, commodities, producers and dates ────────────────
-  // Dates appear in footer blocks (after "Printed on" that is followed by dates)
-  // GRNs/comms appear in body blocks (outside footer)
-
-  const grns = [], comms = [], grnIdx = [], dates = [];
-  let inDateBlock = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Detect footer "Printed on" by checking if dates follow shortly after
-    if (/^Printed on/.test(line)) {
-      let hasDateAhead = false;
-      for (let j = i+1; j < Math.min(i+5, lines.length); j++) {
-        if (/^\d{2}\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/\d{4}$/i.test(lines[j])) {
-          hasDateAhead = true; break;
-        }
-      }
-      if (hasDateAhead) { inDateBlock = true; continue; }
-      else continue; // header "Printed on" - skip
-    }
-
-    if (/^0{10,}$/.test(line) || /^JOHANNESBURG/.test(line) || /^CONSIGNMENT/.test(line)) {
-      inDateBlock = false;
-      continue;
-    }
-
-    if (inDateBlock) {
-      const dm = line.match(/^(\d{2})\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/(\d{4})$/i);
-      if (dm) dates.push(`${dm[1]}/${MONTHS[dm[2].toUpperCase()]}/${dm[3]}`);
-    } else {
-      if (/^\d{8}$/.test(line)) { grns.push(line); grnIdx.push(i); }
-      if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(line)) comms.push(line);
-    }
+  function isDateLine(line) {
+    return /^\d{2}\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/\d{4}$/.test(line);
   }
 
-  // ── Pass 2: find producers for each GRN ──────────────────────────────────
-  const producers = grnIdx.map(idx => {
+  function parseDate(line) {
+    const m = line.match(/^(\d{2})\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/(\d{4})$/);
+    if (!m) return null;
+    return `${m[1]}/${MONTHS[m[2]]}/${m[3]}`;
+  }
+
+  const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
+
+  // ── Collect all dates from the document ───────────────────────────────────
+  // Dates appear after "Page X of Y" lines (which follow "Printed on" footers)
+  // Strategy: simply collect ALL date-format lines in document order
+  // They correspond 1:1 with GRNs in document order
+  const allDates = [];
+  const allGRNs  = [];
+  const allComms = [];
+  const grnLineIdx = [];
+
+  // First pass: collect everything
+  lines.forEach((line, i) => {
+    if (/^\d{8}$/.test(line)) { allGRNs.push(line); grnLineIdx.push(i); }
+    if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(line)) allComms.push(line);
+    if (isDateLine(line)) allDates.push(parseDate(line));
+  });
+
+  console.log(`   📊 parseStockPdf: grns:${allGRNs.length} comms:${allComms.length} dates:${allDates.length} from ${filename}`);
+
+  // ── Find producers ────────────────────────────────────────────────────────
+  const producers = grnLineIdx.map(idx => {
     for (let b = idx-1; b >= Math.max(0, idx-4); b--) {
       const pl = lines[b];
       if (!pl || /^\d/.test(pl) || pl.indexOf(',') > 0) break;
@@ -226,32 +218,32 @@ function parseStockPdf(snippet, filename, today) {
     return '';
   });
 
-  // ── Pass 3: collect qty numbers (after last commodity line) ──────────────
-  const lastCommLineIdx = lines.reduce((acc, l, i) =>
-    /^[A-Z]{2,5},[A-Z0-9]+,/.test(l) && !lines.slice(i+1,i+10).some(x => /^[A-Z]{2,5},[A-Z0-9]+,/.test(x))
-    ? i : acc, 0);
-
+  // ── Collect qty numbers (after last commodity) ────────────────────────────
+  // Find the last commodity line position
+  let lastCommPos = 0;
+  lines.forEach((l, i) => { if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(l)) lastCommPos = i; });
+  
   const nums = [];
-  for (let i = lastCommLineIdx + 1; i < lines.length; i++) {
+  for (let i = lastCommPos + 1; i < lines.length; i++) {
     const t = lines[i].replace(/,/g,'');
-    if (/^\d+$/.test(t) && !/^(\d{2})\/(JAN|FEB)/.test(lines[i])) nums.push(t);
+    if (/^\d+$/.test(t) && !isDateLine(lines[i])) nums.push(t);
   }
 
-  // ── Zip together ─────────────────────────────────────────────────────────
-  const minLen = Math.min(grns.length, comms.length);
+  // ── Zip GRNs + commodities + dates ───────────────────────────────────────
+  const minLen = Math.min(allGRNs.length, allComms.length);
   const results = [];
   let nIdx = 0;
 
   for (let i = 0; i < minLen; i++) {
-    const grn       = grns[i];
-    const commLine  = comms[i].replace(/[\\]/g,'').trim();
-    const parts     = commLine.split(',');
-    const commodity = parts[0] || 'UNK';
-    const variety   = (parts[2] || '*').trim();
-    const count     = (parts[5] || '*').trim();
-    const producer  = producers[i] || '';
-    const arriveDate = dates[i] || null;
-    const age       = calcAge(arriveDate);
+    const grn        = allGRNs[i];
+    const commLine   = allComms[i].replace(/[\\]/g,'').trim();
+    const parts      = commLine.split(',');
+    const commodity  = parts[0] || 'UNK';
+    const variety    = (parts[2] || '*').trim();
+    const count      = (parts[5] || '*').trim();
+    const producer   = producers[i] || '';
+    const arriveDate = allDates[i] || null;
+    const age        = calcAge(arriveDate);
 
     const rec = parseInt((nums[nIdx] || '0').replace(/,/g,'')) || 0;
     nIdx++;
@@ -264,21 +256,12 @@ function parseStockPdf(snippet, filename, today) {
     }
   }
 
-  console.log(`   📊 parseStockPdf: ${results.length} lines from ${filename} (grns:${grns.length} comms:${comms.length} dates:${dates.length})`); if(dates.length===0) { const sampleDates = lines.filter(l=>/^\d{2}\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/\d{4}$/i.test(l)); console.log(`   🔍 Raw dates found in text: ${sampleDates.length} | sample: ${JSON.stringify(sampleDates.slice(0,3))}`); }
   if (results.length > 0) {
-    const oldest = results.reduce((a,b) => (b.age||0) > (a.age||0) ? b : a);
-    console.log(`   📅 Oldest: ${oldest.producer} ${oldest.commodity} arrived ${oldest.arriveDate} (${oldest.age}d)`);
+    const oldest = results.filter(r => r.age !== null).reduce((a,b) => (b.age||0) > (a.age||0) ? b : a, results[0]);
+    if (oldest.age) console.log(`   📅 Oldest: ${oldest.producer} ${oldest.commodity} arrived ${oldest.arriveDate} (${oldest.age}d)`);
   }
   return results;
-}let db;
-function initFirebase() {
-  if (db) return;
-  const sa = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
-  if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(sa), databaseURL: FIREBASE_DB_URL });
-  db = admin.database();
-  console.log("✅ Firebase connected");
 }
-
 let drive;
 function initDrive() {
   if (drive) return;
