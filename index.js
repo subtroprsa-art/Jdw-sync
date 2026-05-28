@@ -148,9 +148,6 @@ function parseStockPdf(snippet, filename, today) {
 
   const MONTHS = {JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',
                   JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12'};
-  const SKIP = ["CONSIGNMENT","JOHANNESBURG","AGENT:","SALESMAN:","Version","Printed",
-                "Page","STOCK","R S A","GRN","COMMODITY","ARRIVE","COLD","SORT","SIT",
-                "RES","TRAN","D/R","QTY","FLR","REC","SOLD","MARKET","PRODUCE","FRESH","STORE"];
 
   function extractFLR(combined, rec) {
     combined = String(combined).replace(/,/g,'');
@@ -188,48 +185,69 @@ function parseStockPdf(snippet, filename, today) {
     return `${m[1]}/${MONTHS[m[2]]}/${m[3]}`;
   }
 
+  const SKIP_WORDS = ["CONSIGNMENT","JOHANNESBURG","AGENT:","SALESMAN:","Version","Printed",
+                      "Page","STOCK","R S A","GRN","COMMODITY","ARRIVE","COLD","SORT","SIT",
+                      "RES","TRAN","D/R","QTY","FLR","REC","SOLD","MARKET","PRODUCE","FRESH",
+                      "STORE","CASH","CREDIT"];
+
   const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
 
-  // ── Collect all dates from the document ───────────────────────────────────
-  // Dates appear after "Page X of Y" lines (which follow "Printed on" footers)
-  // Strategy: simply collect ALL date-format lines in document order
-  // They correspond 1:1 with GRNs in document order
-  const allDates = [];
+  // ── Collect all columns globally (pdf-parse reads columns left→right) ─────
   const allGRNs  = [];
   const allComms = [];
-  const grnLineIdx = [];
+  const allDates = [];
+  const allNums  = [];
 
-  // First pass: collect everything
+  // Producer block: consecutive non-header text lines that appear just before
+  // the GRN block starts. pdf-parse outputs: producers... GRNs... comms... nums... dates...
+  
+  // Step 1: find where GRNs start and end
+  let firstGRNIdx = -1, lastGRNIdx = -1;
   lines.forEach((line, i) => {
-    if (/^\d{8}$/.test(line)) { allGRNs.push(line); grnLineIdx.push(i); }
+    if (/^\d{8}$/.test(line)) {
+      if (firstGRNIdx === -1) firstGRNIdx = i;
+      lastGRNIdx = i;
+      allGRNs.push(line);
+    }
+  });
+  if (allGRNs.length === 0) return [];
+
+  // Step 2: collect commodities
+  lines.forEach(line => {
     if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(line)) allComms.push(line);
+  });
+
+  // Step 3: collect dates
+  lines.forEach(line => {
     if (isDateLine(line)) allDates.push(parseDate(line));
   });
 
-  console.log(`   📊 parseStockPdf: grns:${allGRNs.length} comms:${allComms.length} dates:${allDates.length} from ${filename}`);
+  // Step 4: collect producer names — the block of non-header text lines
+  // that appear just BEFORE the first GRN
+  // They are consecutive and match the count of GRNs
+  const producerCandidates = [];
+  for (let i = firstGRNIdx - 1; i >= 0; i--) {
+    const line = lines[i];
+    // Stop at header lines
+    if (SKIP_WORDS.some(s => line.toUpperCase().startsWith(s))) break;
+    if (/^\d/.test(line) || line.indexOf(',') > 0) continue;
+    if (line.length > 2) producerCandidates.unshift(line);
+  }
+  
+  // The last N candidates match the N GRNs (where N = allGRNs.length)
+  const producers = producerCandidates.slice(-allGRNs.length);
 
-  // ── Find producers ────────────────────────────────────────────────────────
-  const producers = grnLineIdx.map(idx => {
-    for (let b = idx-1; b >= Math.max(0, idx-4); b--) {
-      const pl = lines[b];
-      if (!pl || /^\d/.test(pl) || pl.indexOf(',') > 0) break;
-      if (pl.length > 2 && !SKIP.some(s => pl.toUpperCase().includes(s))) return pl;
-    }
-    return '';
-  });
-
-  // ── Collect qty numbers (after last commodity) ────────────────────────────
-  // Find the last commodity line position
+  // Step 5: collect qty numbers (after last commodity line)
   let lastCommPos = 0;
   lines.forEach((l, i) => { if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(l)) lastCommPos = i; });
-  
-  const nums = [];
   for (let i = lastCommPos + 1; i < lines.length; i++) {
     const t = lines[i].replace(/,/g,'');
-    if (/^\d+$/.test(t) && !isDateLine(lines[i])) nums.push(t);
+    if (/^\d+$/.test(t) && !isDateLine(lines[i])) allNums.push(t);
   }
 
-  // ── Zip GRNs + commodities + dates ───────────────────────────────────────
+  console.log(`   📊 parseStockPdf: grns:${allGRNs.length} comms:${allComms.length} dates:${allDates.length} producers:${producers.length} from ${filename}`);
+
+  // ── Zip everything together ───────────────────────────────────────────────
   const minLen = Math.min(allGRNs.length, allComms.length);
   const results = [];
   let nIdx = 0;
@@ -245,10 +263,10 @@ function parseStockPdf(snippet, filename, today) {
     const arriveDate = allDates[i] || null;
     const age        = calcAge(arriveDate);
 
-    const rec = parseInt((nums[nIdx] || '0').replace(/,/g,'')) || 0;
+    const rec = parseInt((allNums[nIdx] || '0').replace(/,/g,'')) || 0;
     nIdx++;
     let flr = 0;
-    if (nIdx < nums.length) { flr = extractFLR(nums[nIdx], rec); nIdx++; }
+    if (nIdx < allNums.length) { flr = extractFLR(allNums[nIdx], rec); nIdx++; }
 
     if (flr > 0 && commodity && /^[A-Z]/.test(commodity)) {
       results.push({ grn, producer, commodity, variety, count, flr,
@@ -257,12 +275,16 @@ function parseStockPdf(snippet, filename, today) {
   }
 
   if (results.length > 0) {
-    const oldest = results.filter(r => r.age !== null).reduce((a,b) => (b.age||0) > (a.age||0) ? b : a, results[0]);
-    if (oldest.age) console.log(`   📅 Oldest: ${oldest.producer} ${oldest.commodity} arrived ${oldest.arriveDate} (${oldest.age}d)`);
+    const withAge = results.filter(r => r.age !== null);
+    if (withAge.length > 0) {
+      const oldest = withAge.reduce((a,b) => b.age > a.age ? b : a);
+      console.log(`   📅 Oldest: ${oldest.producer||oldest.grn} ${oldest.commodity} arrived ${oldest.arriveDate} (${oldest.age}d)`);
+    }
+    const withProd = results.filter(r => r.producer);
+    console.log(`   👤 Producers found: ${withProd.length}/${results.length}`);
   }
   return results;
-}
-let db;
+}let db;
 function initFirebase() {
   if (db) return;
   const sa = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
