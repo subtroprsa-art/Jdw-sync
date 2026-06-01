@@ -97,7 +97,7 @@ function buildModel(history) {
   return m;
 }
 
-// ── Buyer slip parser (unchanged) ────────────────────────────────────────────
+// ── Buyer slip parser ────────────────────────────────────────────────────────
 function parseCommodityLine(line) {
   line = (line || "").toUpperCase();
   let commodity = "UNK", variety = "*", count = "*";
@@ -149,7 +149,6 @@ function parsePdfSpatial(pdfPath, filename, today) {
       console.warn("   ⚠️  parse_stock_pdf.py not found");
       return resolve([]);
     }
-    // Pass --debug flag to get column position info
     execFile("python3", [PARSER_SCRIPT, pdfPath, "", today || ""],
       { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
@@ -158,8 +157,6 @@ function parsePdfSpatial(pdfPath, filename, today) {
         try {
           const rows = JSON.parse(stdout);
           if (!Array.isArray(rows)) return resolve([]);
-          // Convert to stock format expected by Firebase/PWA
-          // Note: parser already returns clean fields (commodity="AVOS" not "AVOS,BG150,...")
           const results = rows
             .filter(r => r.producer || r.grn || r.commodity)
             .map(r => ({
@@ -207,7 +204,7 @@ function initDrive() {
 
 // ── Download PDF from Drive to temp file ─────────────────────────────────────
 async function downloadPdfToTemp(fileId, filename) {
-  const tmpPath = path.join(os.tmpdir(), filename); // keep original filename
+  const tmpPath = path.join(os.tmpdir(), filename);
   try {
     const res = await drive.files.get(
       { fileId, alt: "media" },
@@ -221,15 +218,6 @@ async function downloadPdfToTemp(fileId, filename) {
     console.warn(`   ⚠️  Download failed for ${filename}: ${e.message}`);
     return null;
   }
-}
-
-async function getFileId(folderId, filename) {
-  const res = await drive.files.list({
-    q: `'${folderId}' in parents and name = '${filename}'`,
-    fields: "files(id,name)",
-    pageSize: 5,
-  });
-  return res.data.files?.[0]?.id || null;
 }
 
 // ── STOCK SYNC ───────────────────────────────────────────────────────────────
@@ -265,24 +253,22 @@ async function syncStock() {
 
     let allStock = [];
     for (const file of todayFiles) {
-      // Download PDF to temp file
       const tmpPath = await downloadPdfToTemp(file.id, file.name);
       if (!tmpPath) continue;
 
       try {
-        // Detect user from filename
+        // ── FIX: correct user detection ──────────────────────────────────────
         const base = file.name.toLowerCase().replace(".pdf","");
         let user = "unknown";
-        if (base.includes("pot") || base.includes("riaan")) user = "RJ";
-        else if (base.includes("cdw")) user = "CW";
+        if      (base.includes("riaan")) user = "RJ";
+        else if (base.includes("cdw"))   user = "CW";
+        else if (base.includes("pot"))   user = "POT";
+        // ─────────────────────────────────────────────────────────────────────
 
-        // Parse with spatial parser
         const rows = await parsePdfSpatial(tmpPath, file.name, today);
-        // Tag each row with user
         rows.forEach(r => r.user = user);
         allStock = allStock.concat(rows);
       } finally {
-        // Clean up temp file
         try { fs.unlinkSync(tmpPath); } catch {}
       }
     }
@@ -292,7 +278,6 @@ async function syncStock() {
       return;
     }
 
-    // Push to Firebase — replaces stock for today
     await db.ref("jdw").update({
       stock:          allStock,
       stockDate:      today,
@@ -300,7 +285,6 @@ async function syncStock() {
       stockUpdated:   new Date().toISOString(),
     });
 
-    // Also write to /stock/ path for PWA compatibility
     const stockByUser = {};
     allStock.forEach((e, i) => {
       const u = e.user || "RJ";
@@ -333,7 +317,7 @@ async function syncStock() {
   }
 }
 
-// ── BUYER HISTORY SYNC (unchanged) ───────────────────────────────────────────
+// ── BUYER HISTORY SYNC ───────────────────────────────────────────────────────
 async function syncBuyerHistory() {
   console.log("   🧾 Checking buyer history...");
   try {
@@ -359,7 +343,6 @@ async function syncBuyerHistory() {
     let newRows = [];
     for (const file of newFiles) {
       try {
-        // Download and get text for buyer slips (still use Drive indexable text)
         const fileRes = await drive.files.get({
           fileId: file.id,
           fields: "contentHints/indexableText",
