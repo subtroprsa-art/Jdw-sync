@@ -342,8 +342,11 @@ async function syncStock() {
         producer:  e.producer   || "",
         grn:       e.grn        || "",
         commodity: e.commodity  || "",
+        pack:      e.pack       || "",   // e.g. TR040, BG150, CTT150
         variety:   e.variety    || "*",
-        count:     e.count      || "*",
+        grade:     e.grade      || "1",  // 1 = CL1, 2 = CL2
+        size:      e.count      || "*",  // count field holds the size e.g. 14, 16
+        count:     e.count      || "*",  // keep for backwards compat
         qty_rec:   e.rec        || 0,
         qty_sort:  e.flr        || 0,
         source:    "drive",
