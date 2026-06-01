@@ -97,7 +97,53 @@ function buildModel(history) {
   return m;
 }
 
-// ── Buyer slip parser ────────────────────────────────────────────────────────
+// ── Slip PDF parser (Python subprocess) ──────────────────────────────────────
+const SLIP_PARSER_SCRIPT = path.join(__dirname, "parse_slip_pdf.py");
+
+function parseSlipPdf(pdfPath, filename) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(SLIP_PARSER_SCRIPT)) {
+      console.warn("   ⚠️  parse_slip_pdf.py not found");
+      return resolve([]);
+    }
+    execFile("python3", [SLIP_PARSER_SCRIPT, pdfPath],
+      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (stderr) console.warn(`   ⚠️  slip parser stderr: ${stderr.trim().slice(0,200)}`);
+        if (err) { console.error(`   ❌ Slip parser error: ${err.message}`); return resolve([]); }
+        try {
+          const rows = JSON.parse(stdout);
+          if (!Array.isArray(rows)) return resolve([]);
+          const results = rows
+            .filter(r => r.buyer && r.grn && r.qty > 0)
+            .map(r => ({
+              buyer:     r.buyer,
+              account:   r.account   || '',
+              card:      r.card      || '',
+              grn:       r.grn,
+              invoice:   r.invoice   || '',
+              commodity: r.commodity || 'UNK',
+              variety:   r.variety   || '*',
+              cls:       r.cls       || '1',
+              size:      r.size      || '*',
+              qty:       r.qty,
+              price:     r.price,
+              total:     r.total,
+              date:      r.date,
+              src:       filename,
+            }));
+          console.log(`   ✅ Slip parser: ${results.length} rows from ${filename}`);
+          resolve(results);
+        } catch(e) {
+          console.error(`   ❌ Slip JSON parse error: ${e.message}`);
+          resolve([]);
+        }
+      }
+    );
+  });
+}
+
+// ── Buyer slip parser (legacy fallback) ──────────────────────────────────────
 function parseCommodityLine(line) {
   line = (line || "").toUpperCase();
   let commodity = "UNK", variety = "*", count = "*";
@@ -342,19 +388,32 @@ async function syncBuyerHistory() {
 
     let newRows = [];
     for (const file of newFiles) {
+      let tmpPath = null;
       try {
-        const fileRes = await drive.files.get({
-          fileId: file.id,
-          fields: "contentHints/indexableText",
-        });
-        const snippet = fileRes.data?.contentHints?.indexableText || "";
-        const rows    = parseSlip(snippet, file.name);
+        // Download PDF and parse with OCR parser
+        tmpPath = await downloadPdfToTemp(file.id, file.name);
+        let rows = [];
+        if (tmpPath) {
+          rows = await parseSlipPdf(tmpPath, file.name);
+        }
+        // Fallback to indexableText if parser returns nothing
+        if (rows.length === 0) {
+          console.warn(`   ⚠️  OCR parser got 0 rows for ${file.name}, trying indexableText`);
+          const fileRes = await drive.files.get({
+            fileId: file.id,
+            fields: "contentHints/indexableText",
+          });
+          const snippet = fileRes.data?.contentHints?.indexableText || "";
+          rows = parseSlip(snippet, file.name);
+        }
         newRows = newRows.concat(rows);
         processed[file.id] = new Date().toISOString();
         console.log(`   ✅ ${file.name} → ${rows.length} rows (${rows[0]?.buyer || "?"})`);
       } catch(e) {
         console.warn(`   ⚠️  ${file.name}: ${e.message}`);
         processed[file.id] = "error";
+      } finally {
+        if (tmpPath) { try { fs.unlinkSync(tmpPath); } catch {} }
       }
     }
 
