@@ -158,26 +158,21 @@ function parsePdfSpatial(pdfPath, filename, today) {
           const rows = JSON.parse(stdout);
           if (!Array.isArray(rows)) return resolve([]);
           // Convert to stock format expected by Firebase/PWA
+          // Note: parser already returns clean fields (commodity="AVOS" not "AVOS,BG150,...")
           const results = rows
             .filter(r => r.producer || r.grn || r.commodity)
-            .map(r => {
-              const parts = (r.commodity || "").split(",");
-              const commodity = parts[0] || "UNK";
-              const variety   = parts[2] || "*";
-              const count     = parts[5] || "*";
-              return {
-                grn:        String(r.grn || ""),
-                producer:   String(r.producer || ""),
-                commodity,
-                variety,
-                count,
-                flr:        Number(r.qty_sort) || 0,
-                rec:        Number(r.qty_rec)  || 0,
-                arriveDate: r.date || null,
-                stockDate:  today,
-                src:        filename,
-              };
-            })
+            .map(r => ({
+              grn:        String(r.grn        || ""),
+              producer:   String(r.producer   || ""),
+              commodity:  String(r.commodity  || "UNK"),
+              variety:    String(r.variety    || "*"),
+              count:      String(r.count      || "*"),
+              flr:        Number(r.qty_sort)  || 0,
+              rec:        Number(r.qty_rec)   || 0,
+              arriveDate: r.date              || null,
+              stockDate:  today,
+              src:        filename,
+            }))
             .filter(r => r.grn || r.producer);
           console.log(`   ✅ Spatial parser: ${results.length} rows from ${filename}`);
           resolve(results);
@@ -284,7 +279,6 @@ async function syncStock() {
         // Tag each row with user
         rows.forEach(r => r.user = user);
         allStock = allStock.concat(rows);
-        console.log(`   ✅ ${file.name} → ${rows.length} stock lines (user=${user})`);
       } finally {
         // Clean up temp file
         try { fs.unlinkSync(tmpPath); } catch {}
@@ -313,11 +307,13 @@ async function syncStock() {
       stockByUser[u][id] = {
         id, user: u,
         date:      e.arriveDate || today,
-        producer:  e.producer  || "",
-        grn:       e.grn       || "",
-        commodity: e.commodity || "",
-        qty_rec:   e.rec       || 0,
-        qty_sort:  e.flr       || 0,
+        producer:  e.producer   || "",
+        grn:       e.grn        || "",
+        commodity: e.commodity  || "",
+        variety:   e.variety    || "*",
+        count:     e.count      || "*",
+        qty_rec:   e.rec        || 0,
+        qty_sort:  e.flr        || 0,
         source:    "drive",
         uploadedAt: new Date().toISOString(),
       };
