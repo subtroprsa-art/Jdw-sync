@@ -1,27 +1,25 @@
 /**
  * jdw-sync — Express sync server
  * ────────────────────────────────
- * PDF parsing uses Claude Vision API (Anthropic):
- *   PDF → PNG pages (pdftoppm) → base64 → claude-sonnet → JSON rows
- *
- * This is immune to column-mixing because Claude reads the table visually,
- * exactly as a human would, regardless of how the PDF stores its text stream.
+ * PDF parsing uses parse_stock_pdf.py (pdfplumber spatial parser).
  *
  * Endpoints:
- *   POST /upload-stock   multipart PDF → parse → write Firebase
- *   GET  /stock/:user    read stock from Firebase
- *   DELETE /stock/:user/:id
- *   GET  /               health check
+ *   POST   /upload-stock        upload PDF → parse → append to Firebase
+ *   POST   /clear-and-upload    upload PDF → wipe user's stock → write fresh
+ *   DELETE /stock/:user         wipe ALL stock for a user (RJ, CW, or all)
+ *   DELETE /stock/:user/:id     delete single entry
+ *   GET    /stock/:user         read stock for user
+ *   GET    /                    health check
  */
 
-const express        = require('express');
-const cors           = require('cors');
-const multer         = require('multer');
-const { execFile, exec } = require('child_process');
-const path           = require('path');
-const fs             = require('fs');
-const os             = require('os');
-const admin          = require('firebase-admin');
+const express         = require('express');
+const cors            = require('cors');
+const multer          = require('multer');
+const { execFile }    = require('child_process');
+const path            = require('path');
+const fs              = require('fs');
+const os              = require('os');
+const admin           = require('firebase-admin');
 
 // ── Firebase ──────────────────────────────────────────────────────────────────
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
@@ -34,17 +32,19 @@ const db = admin.database();
 // ── Express ───────────────────────────────────────────────────────────────────
 const app    = express();
 const upload = multer({ dest: os.tmpdir() });
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://subtroprsa-art.github.io',
+    'https://cdjcrm.netlify.app',
+    'https://shimmering-banoffee-ba1043.netlify.app',
+    /\.netlify\.app$/,
+    /\.github\.io$/,
+  ]
+}));
 app.use(express.json());
 
-// ── Config ────────────────────────────────────────────────────────────────────
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const ANTHROPIC_URL     = 'https://api.anthropic.com/v1/messages';
-const VISION_MODEL      = 'claude-sonnet-4-20250514';
-const PDF_DPI           = 150;   // 150 DPI → ~A4 page ≈ 1240×1754px, good quality, small size
-
-// ── Filename parser ───────────────────────────────────────────────────────────
-// Filenames: DDMMYYYYPOT.pdf | DDMMYYYYCDW.pdf | DDMMYYYYriaan.pdf
+// ── Filename → user + date ────────────────────────────────────────────────────
+// DDMMYYYYPOT.pdf → RJ   DDMMYYYYCDW.pdf → CW   DDMMYYYYriaan.pdf → RJ
 function parseFilename(filename) {
   const base = path.basename(filename, '.pdf').toLowerCase();
   const m    = base.match(/^(\d{2})(\d{2})(\d{4})/);
@@ -55,162 +55,77 @@ function parseFilename(filename) {
   return { user, dateStr };
 }
 
-// ── PDF → PNG pages ───────────────────────────────────────────────────────────
-function pdfToImages(pdfPath, outDir) {
+// ── Python spatial parser ─────────────────────────────────────────────────────
+const PARSER = path.join(__dirname, 'parse_stock_pdf.py');
+
+function parsePDF(pdfPath, user, dateStr) {
   return new Promise((resolve, reject) => {
-    const prefix = path.join(outDir, 'page');
-    execFile('pdftoppm', ['-png', '-r', String(PDF_DPI), pdfPath, prefix],
-      { timeout: 60_000 },
-      (err, _stdout, stderr) => {
-        if (err) return reject(new Error(`pdftoppm failed: ${stderr || err.message}`));
-        // pdftoppm writes page-1.png, page-2.png … (zero-padded to page count)
-        const files = fs.readdirSync(outDir)
-          .filter(f => f.startsWith('page') && f.endsWith('.png'))
-          .sort()
-          .map(f => path.join(outDir, f));
-        resolve(files);
+    const args = [PARSER, pdfPath, user || '', dateStr || ''].filter(Boolean);
+    execFile('python3', args, { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (stderr) console.warn('[parser]', stderr.trim());
+        if (err)    return reject(new Error(`Parser failed: ${stderr || err.message}`));
+        try {
+          const result = JSON.parse(stdout);
+          if (result?.error) return reject(new Error(result.error));
+          resolve(Array.isArray(result) ? result : []);
+        } catch {
+          reject(new Error('Parser returned non-JSON output'));
+        }
       }
     );
   });
 }
 
-// ── Claude Vision: parse one page image ──────────────────────────────────────
-const SYSTEM_PROMPT = `You are a precise agricultural stock data extractor.
-You will be shown a page from a stock intake PDF used by a South African grain depot.
-Extract every data row from the table and return ONLY a JSON array — no markdown, no explanation.
-
-Each object in the array must have exactly these keys (use null if a value is not present):
-  producer   - the producer/farmer/supplier name
-  grn        - the GRN number or receipt number (string, keep any prefix like "GRN-")
-  commodity  - the commodity/product name (e.g. MAIZE, WHEAT, SUNFLOWER, SOYA)
-  date       - the date in YYYY-MM-DD format
-  quantity   - the mass/quantity as a plain number (kg or tons as shown, no units)
-  bags       - number of bags/units as a plain integer
-
-Rules:
-- Ignore header rows, totals rows, blank rows, and page numbers.
-- If a column header is in Afrikaans (Produsent, Produk, Datum, Gewig, Sakke) map it to the English key.
-- Dates: convert any format (DD/MM/YYYY, D-M-YY, etc.) to YYYY-MM-DD.
-- Numbers: strip commas and spaces, return as number type not string.
-- If a page has no table data, return an empty array [].
-- Return ONLY the JSON array, nothing else.`;
-
-async function parsePageWithVision(imagePath) {
-  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY env var not set');
-
-  const imageData = fs.readFileSync(imagePath).toString('base64');
-
-  const body = {
-    model:      VISION_MODEL,
-    max_tokens: 4096,
-    system:     SYSTEM_PROMPT,
-    messages: [{
-      role:    'user',
-      content: [
-        {
-          type:   'image',
-          source: { type: 'base64', media_type: 'image/png', data: imageData },
-        },
-        {
-          type: 'text',
-          text: 'Extract all stock table rows from this page as JSON.',
-        },
-      ],
-    }],
-  };
-
-  const response = await fetch(ANTHROPIC_URL, {
-    method:  'POST',
-    headers: {
-      'Content-Type':      'application/json',
-      'x-api-key':         ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`Anthropic API error ${response.status}: ${text}`);
-  }
-
-  const data   = await response.json();
-  const raw    = data.content?.[0]?.text?.trim() || '[]';
-
-  // Strip any accidental markdown fences
-  const clean  = raw.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```\s*$/,'').trim();
-
-  try {
-    const rows = JSON.parse(clean);
-    return Array.isArray(rows) ? rows : [];
-  } catch {
-    console.error('[vision] JSON parse failed, raw response:', raw.slice(0, 300));
-    return [];
-  }
-}
-
-// ── Normalise rows into Firebase schema ───────────────────────────────────────
+// ── Normalise into Firebase schema ────────────────────────────────────────────
 function normaliseEntries(rows, filenameDate, user) {
   return rows
-    .filter(r => r && (r.producer || r.commodity || r.grn))
+    .filter(r => r && (r.producer || r.grn || r.commodity))
     .map((r, i) => ({
-      id:         `${Date.now()}_${i}`,
-      user,
-      date:       r.date        || filenameDate || new Date().toISOString().slice(0, 10),
-      producer:   String(r.producer  || '').trim(),
-      grn:        String(r.grn       || '').trim(),
-      commodity:  String(r.commodity || '').trim(),
-      quantity:   Number(r.quantity) || 0,
-      bags:       parseInt(r.bags)   || 0,
-      source:     'vision',
-      uploadedAt: new Date().toISOString(),
+      id:          `${Date.now()}_${i}`,
+      user:        r._user  || user,
+      date:        r.date   || filenameDate || new Date().toISOString().slice(0, 10),
+      producer:    String(r.producer  || '').trim(),
+      grn:         String(r.grn       || '').trim(),
+      commodity:   String(r.commodity || '').trim(),
+      qty_rec:     Number(r.qty_rec)  || 0,
+      qty_sort:    Number(r.qty_sort) || 0,
+      source:      'pdf',
+      uploadedAt:  new Date().toISOString(),
     }));
 }
 
-// ── POST /upload-stock ────────────────────────────────────────────────────────
-app.post('/upload-stock', upload.single('pdf'), async (req, res) => {
+// ── Shared upload handler ─────────────────────────────────────────────────────
+async function handleUpload(req, res, clearFirst) {
   if (!req.file) return res.status(400).json({ error: 'No PDF uploaded (field: pdf)' });
 
   const tmpPdf = req.file.path;
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jdw-'));
-
   try {
     const origName          = req.file.originalname || req.file.filename;
     const { user, dateStr } = parseFilename(origName);
     const finalUser         = req.body.user || user;
 
-    console.log(`[upload] "${origName}" → user=${finalUser} date=${dateStr}`);
+    console.log(`[upload] "${origName}" user=${finalUser} date=${dateStr} clearFirst=${clearFirst}`);
 
-    // 1. Convert PDF pages to PNG images
-    const imageFiles = await pdfToImages(tmpPdf, tmpDir);
-    console.log(`[upload] ${imageFiles.length} page(s) to process`);
-
-    // 2. Send each page to Claude Vision (sequentially to avoid rate limits)
-    const allRows = [];
-    for (let i = 0; i < imageFiles.length; i++) {
-      console.log(`[upload] Vision parsing page ${i + 1}/${imageFiles.length}…`);
-      try {
-        const rows = await parsePageWithVision(imageFiles[i]);
-        console.log(`[upload] page ${i + 1}: ${rows.length} rows`);
-        allRows.push(...rows);
-      } catch (err) {
-        console.error(`[upload] page ${i + 1} vision error:`, err.message);
-        // Continue — don't fail the whole upload on one bad page
-      }
+    // Optionally wipe existing stock first
+    if (clearFirst) {
+      await db.ref(`/stock/${finalUser}`).remove();
+      console.log(`[upload] cleared existing stock for ${finalUser}`);
     }
 
-    // 3. Normalise
-    const entries = normaliseEntries(allRows, dateStr, finalUser);
-    console.log(`[upload] ${entries.length} valid entries total`);
+    // Parse with Python
+    const raw     = await parsePDF(tmpPdf, finalUser, dateStr);
+    const entries = normaliseEntries(raw, dateStr, finalUser);
+    console.log(`[upload] ${entries.length} entries`);
 
     if (entries.length === 0) {
       return res.status(422).json({
         error: 'No stock rows found in this PDF',
-        hint:  'Make sure the PDF contains a table with Producer / GRN / Commodity / Date / Quantity columns',
+        hint:  'Make sure this is a JFPM Consignment Stock Take PDF',
       });
     }
 
-    // 4. Write to Firebase /stock/<user>/<id>
+    // Write to Firebase
     const updates = {};
     for (const e of entries) updates[`/stock/${e.user}/${e.id}`] = e;
     await db.ref().update(updates);
@@ -218,19 +133,22 @@ app.post('/upload-stock', upload.single('pdf'), async (req, res) => {
     return res.json({ success: true, user: finalUser, date: dateStr, count: entries.length, entries });
 
   } catch (err) {
-    console.error('[upload] fatal:', err.message);
+    console.error('[upload] error:', err.message);
     return res.status(500).json({ error: err.message });
   } finally {
     fs.unlink(tmpPdf, () => {});
-    // Clean up temp image dir
-    try {
-      for (const f of fs.readdirSync(tmpDir)) fs.unlinkSync(path.join(tmpDir, f));
-      fs.rmdirSync(tmpDir);
-    } catch {}
   }
-});
+}
 
-// ── GET /stock/:user ──────────────────────────────────────────────────────────
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+// Append new stock from PDF
+app.post('/upload-stock', upload.single('pdf'), (req, res) => handleUpload(req, res, false));
+
+// Wipe user's stock then upload fresh
+app.post('/clear-and-upload', upload.single('pdf'), (req, res) => handleUpload(req, res, true));
+
+// Read stock
 app.get('/stock/:user', async (req, res) => {
   try {
     const { user } = req.params;
@@ -242,7 +160,20 @@ app.get('/stock/:user', async (req, res) => {
   }
 });
 
-// ── DELETE /stock/:user/:id ───────────────────────────────────────────────────
+// Wipe all stock for a user (or all users)
+app.delete('/stock/:user', async (req, res) => {
+  try {
+    const { user } = req.params;
+    const ref = user === 'all' ? db.ref('/stock') : db.ref(`/stock/${user}`);
+    await ref.remove();
+    console.log(`[clear] wiped stock for user=${user}`);
+    return res.json({ success: true, user });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete single entry
 app.delete('/stock/:user/:id', async (req, res) => {
   try {
     await db.ref(`/stock/${req.params.user}/${req.params.id}`).remove();
@@ -252,9 +183,9 @@ app.delete('/stock/:user/:id', async (req, res) => {
   }
 });
 
-// ── Health ────────────────────────────────────────────────────────────────────
+// Health
 app.get('/', (_req, res) => res.send('jdw-sync alive'));
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// Start
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`jdw-sync listening on :${PORT} [vision parser]`));
+app.listen(PORT, () => console.log(`jdw-sync listening on :${PORT}`));
