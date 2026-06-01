@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
 """
-JDW Stock PDF Parser v4 - Layout Line Approach
+JDW Stock PDF Parser v5 - Layout Line Approach
 ================================================
-Uses pdfplumber's extract_text_lines(layout=True) which preserves the
-full row on a single line, then parses each line with regex.
-
-This is immune to column-mixing AND works on both direct uploads
-and Google Drive downloaded PDFs.
+Extracts commodity, pack, variety, grade, size from the comma-separated
+commodity field e.g. AVOS,BG150,AF,2,M,*,*
 
 Usage:  python3 parse_stock_pdf.py <pdf> [username] [YYYY-MM-DD]
 Output: JSON array to stdout. Errors to stderr, exit 1.
@@ -20,23 +17,68 @@ MONTH_MAP = {
     'JUL':'07','AUG':'08','SEP':'09','OCT':'10','NOV':'11','DEC':'12',
 }
 
+# Pack code to display name mapping
+PACK_NAMES = {
+    'TR040': '4KG TRAY',
+    'BG150': '15KG BAG',
+    'BG160': '16KG BAG',
+    'SP170': '17KG SPECIAL',
+    'CTT150': '15KG CARTON',
+    'PTB005': '500G PUNNET',
+    'PTB002': '160G PUNNET',
+    'DL076': 'DL 076 CARTON',
+    'PC030': '3KG POCKET',
+    'PC060': '6KG POCKET',
+    'ECO020': '2KG ECONO PACK',
+}
+
 def parse_date(s):
-    # DD/MON/YYYY
     m = re.match(r'(\d{1,2})[/\-]([A-Za-z]{3})[/\-](\d{4})', s)
     if m:
         d, mon, y = m.group(1), m.group(2).upper(), m.group(3)
         return f"{y}-{MONTH_MAP.get(mon,'00')}-{d.zfill(2)}"
-    # YYYY-MM-DD
     m = re.match(r'(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})', s)
     if m:
         return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
-    # DD/MM/YYYY
     m = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', s)
     if m:
         d, mo, y = m.group(1), m.group(2), m.group(3)
         if len(y) == 2: y = '20' + y
         return f"{y}-{mo.zfill(2)}-{d.zfill(2)}"
     return s
+
+def parse_comm_field(comm_str):
+    """
+    Parse commodity field e.g. AVOS,BG150,AF,2,M,*,*
+    Returns dict with commodity, pack, variety, grade, size
+    
+    Format: COMMODITY, PACK_CODE, VARIETY, GRADE, SIZE, ?, ?
+    e.g.    AVOS,     TR040,     AF,      1,     14,   *,  *
+            AVOS,     BG150,     AH,      2,     M,    *,  *
+            KIWI,     PTB005,    *,       1,     20,   *,  *
+            LEMS,     CTT150,    *,       1,     56,   *,  *
+    """
+    parts = [p.strip() for p in comm_str.split(',')]
+    
+    commodity = parts[0] if len(parts) > 0 else 'UNK'
+    pack      = parts[1] if len(parts) > 1 else '*'
+    variety   = parts[2] if len(parts) > 2 else '*'
+    grade     = parts[3] if len(parts) > 3 else '1'
+    size      = parts[4] if len(parts) > 4 else '*'
+    
+    # Clean up
+    pack    = pack    if pack    else '*'
+    variety = variety if variety else '*'
+    grade   = grade   if grade   and grade.isdigit() else '1'
+    size    = size    if size    else '*'
+    
+    return {
+        'commodity': commodity,
+        'pack':      pack,
+        'variety':   variety,
+        'grade':     grade,
+        'size':      size,
+    }
 
 def parse_layout_line(line_text):
     """
@@ -62,21 +104,27 @@ def parse_layout_line(line_text):
 
     rest = t[grn_pos + len(grn):].strip()
 
-    # Commodity: e.g. AVOS,BG150,AF,2,M,*,*
+    # Commodity field: e.g. AVOS,BG150,AF,2,M,*,*
     comm_match = re.search(r'([A-Z]{2,5},[A-Z0-9]+,[A-Z*0-9]+(?:,[^\s]+)*)', rest)
-    commodity  = comm_match.group(1).split(',')[0] if comm_match else 'UNK'
-    comm_end   = comm_match.end() if comm_match else 0
+    
+    if comm_match:
+        comm_str  = comm_match.group(1)
+        comm_data = parse_comm_field(comm_str)
+        comm_end  = comm_match.end()
+    else:
+        comm_data = {'commodity': 'UNK', 'pack': '*', 'variety': '*', 'grade': '1', 'size': '*'}
+        comm_end  = 0
 
     # Date after commodity
-    after_comm  = rest[comm_end:].strip()
-    date_match  = re.search(r'(\d{1,2}/[A-Z]{3}/\d{4})', after_comm)
-    date        = parse_date(date_match.group(1)) if date_match else None
-    date_end    = date_match.end() if date_match else 0
+    after_comm = rest[comm_end:].strip()
+    date_match = re.search(r'(\d{1,2}/[A-Z]{3}/\d{4})', after_comm)
+    date       = parse_date(date_match.group(1)) if date_match else None
+    date_end   = date_match.end() if date_match else 0
 
     # Quantities after date
-    after_date  = after_comm[date_end:].strip() if date_match else after_comm
-    nums        = re.findall(r'\b(\d[\d,]*)\b', after_date)
-    clean_nums  = []
+    after_date = after_comm[date_end:].strip() if date_match else after_comm
+    nums       = re.findall(r'\b(\d[\d,]*)\b', after_date)
+    clean_nums = []
     for n in nums:
         v = n.replace(',', '')
         try:
@@ -90,7 +138,11 @@ def parse_layout_line(line_text):
     return {
         'producer':  producer,
         'grn':       grn,
-        'commodity': commodity,
+        'commodity': comm_data['commodity'],
+        'pack':      comm_data['pack'],
+        'variety':   comm_data['variety'],
+        'grade':     comm_data['grade'],
+        'size':      comm_data['size'],
         'date':      date,
         'qty_rec':   qty_rec,
         'qty_sort':  qty_sort,
