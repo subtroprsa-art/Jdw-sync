@@ -1,20 +1,24 @@
 /**
- * jdw-sync v2
+ * jdw-sync v3
  * - Buyer History: watches folder, adds new slips incrementally
  * - Stock Scans: watches folder, always uses ONLY the latest day's PDFs
- *   (previous days are ignored — stock resets daily)
+ *   Uses parse_stock_pdf.py (pdfplumber spatial parser) instead of pdf-parse
  */
 
 const { google }  = require("googleapis");
-const pdfParse   = require("pdf-parse");
 const admin       = require("firebase-admin");
 const cron        = require("node-cron");
 const http        = require("http");
+const { execFile } = require("child_process");
+const fs          = require("fs");
+const os          = require("os");
+const path        = require("path");
 
 const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
 const STOCK_SCANS_FOLDER   = process.env.DRIVE_STOCK_SCANS_FOLDER_ID   || "1DrYmim6xThu6KfKRplr5SDBVZc-BFMBm";
 const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
 const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
+const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
 
 // ── Seed history (base data) ─────────────────────────────────────────────────
 const SEED_HISTORY = [
@@ -93,7 +97,7 @@ function buildModel(history) {
   return m;
 }
 
-// ── Commodity parser ─────────────────────────────────────────────────────────
+// ── Buyer slip parser (unchanged) ────────────────────────────────────────────
 function parseCommodityLine(line) {
   line = (line || "").toUpperCase();
   let commodity = "UNK", variety = "*", count = "*";
@@ -115,7 +119,6 @@ function parseCommodityLine(line) {
   return { commodity, variety, count };
 }
 
-// ── Buyer slip parser ────────────────────────────────────────────────────────
 function parseSlip(snippet, filename) {
   if (!snippet) return [];
   const rows = [];
@@ -139,152 +142,56 @@ function parseSlip(snippet, filename) {
   return rows;
 }
 
-// ── Stock take parser ─────────────────────────────────────────────────────────
-// Handles the JHB Market CONSIGNMENT STOCK TAKE PDF format.
-// Each entry appears as: Producer\nGRN\nCOMMODITY\nQTY_REC\n[QTY_SOLD]\n[00FLR or merged]
-// FLR is always the last numeric field. Leading-zero blocks encode multiple columns.
-function parseStockPdf(snippet, filename, today) {
-  if (!snippet) return [];
-
-  const MONTHS = {JAN:'01',FEB:'02',MAR:'03',APR:'04',MAY:'05',JUN:'06',
-                  JUL:'07',AUG:'08',SEP:'09',OCT:'10',NOV:'11',DEC:'12'};
-
-  function extractFLR(combined, rec) {
-    combined = String(combined).replace(/,/g,'');
-    const m = combined.match(/0{2,}(\d+)$/);
-    if (m) return parseInt(m[1]) || 0;
-    const m2 = combined.match(/0(\d{2,})$/);
-    if (m2) { const c = parseInt(m2[1]); if (!rec || c <= rec) return c; }
-    if (combined.length > 4 && rec) {
-      for (const ln of [3,4,2]) {
-        if (combined.length >= ln) {
-          const c = parseInt(combined.slice(-ln).replace(/^0+/,'') || '0');
-          if (c >= 0 && c <= rec) return c;
+// ── Spatial PDF parser (Python subprocess) ───────────────────────────────────
+function parsePdfSpatial(pdfPath, filename, today) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(PARSER_SCRIPT)) {
+      console.warn("   ⚠️  parse_stock_pdf.py not found");
+      return resolve([]);
+    }
+    execFile("python3", [PARSER_SCRIPT, pdfPath, "", today || ""],
+      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (stderr) console.warn(`   ⚠️  parser stderr: ${stderr.trim().slice(0,200)}`);
+        if (err) { console.error(`   ❌ Parser error: ${err.message}`); return resolve([]); }
+        try {
+          const rows = JSON.parse(stdout);
+          if (!Array.isArray(rows)) return resolve([]);
+          // Convert to stock format expected by Firebase/PWA
+          const results = rows
+            .filter(r => r.producer || r.grn || r.commodity)
+            .map(r => {
+              const parts = (r.commodity || "").split(",");
+              const commodity = parts[0] || "UNK";
+              const variety   = parts[2] || "*";
+              const count     = parts[5] || "*";
+              return {
+                grn:        String(r.grn || ""),
+                producer:   String(r.producer || ""),
+                commodity,
+                variety,
+                count,
+                flr:        Number(r.qty_sort) || 0,
+                rec:        Number(r.qty_rec)  || 0,
+                arriveDate: r.date || null,
+                stockDate:  today,
+                src:        filename,
+              };
+            })
+            .filter(r => r.grn || r.producer);
+          console.log(`   ✅ Spatial parser: ${results.length} rows from ${filename}`);
+          resolve(results);
+        } catch(e) {
+          console.error(`   ❌ JSON parse error: ${e.message}`);
+          resolve([]);
         }
       }
-    }
-    return parseInt(combined) || 0;
-  }
-
-  function calcAge(dateStr) {
-    if (!dateStr) return null;
-    try {
-      const p = dateStr.split('/');
-      const d = new Date(parseInt(p[2]), parseInt(p[1])-1, parseInt(p[0]));
-      return Math.floor((Date.now() - d.getTime()) / 86400000);
-    } catch { return null; }
-  }
-
-  function isDateLine(line) {
-    return /^\d{2}\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/\d{4}$/.test(line);
-  }
-
-  function parseDate(line) {
-    const m = line.match(/^(\d{2})\/(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\/(\d{4})$/);
-    if (!m) return null;
-    return `${m[1]}/${MONTHS[m[2]]}/${m[3]}`;
-  }
-
-  const SKIP_WORDS = ["CONSIGNMENT","JOHANNESBURG","AGENT:","SALESMAN:","Version","Printed",
-                      "Page","STOCK","R S A","GRN","COMMODITY","ARRIVE","COLD","SORT","SIT",
-                      "RES","TRAN","D/R","QTY","FLR","REC","SOLD","MARKET","PRODUCE","FRESH",
-                      "STORE","CASH","CREDIT"];
-
-  const lines = snippet.split(/\n/).map(l => l.trim()).filter(l => l.length > 0);
-
-  // ── Collect all columns globally (pdf-parse reads columns left→right) ─────
-  const allGRNs  = [];
-  const allComms = [];
-  const allDates = [];
-  const allNums  = [];
-
-  // Producer block: consecutive non-header text lines that appear just before
-  // the GRN block starts. pdf-parse outputs: producers... GRNs... comms... nums... dates...
-  
-  // Step 1: find where GRNs start and end
-  let firstGRNIdx = -1, lastGRNIdx = -1;
-  lines.forEach((line, i) => {
-    if (/^\d{8}$/.test(line)) {
-      if (firstGRNIdx === -1) firstGRNIdx = i;
-      lastGRNIdx = i;
-      allGRNs.push(line);
-    }
+    );
   });
-  if (allGRNs.length === 0) return [];
+}
 
-  // Step 2: collect commodities
-  lines.forEach(line => {
-    if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(line)) allComms.push(line);
-  });
-
-  // Step 3: collect dates
-  lines.forEach(line => {
-    if (isDateLine(line)) allDates.push(parseDate(line));
-  });
-
-  // Step 4: collect producer names — the block of non-header text lines
-  // that appear just BEFORE the first GRN
-  // They are consecutive and match the count of GRNs
-  const producerCandidates = [];
-  for (let i = firstGRNIdx - 1; i >= 0; i--) {
-    const line = lines[i];
-    // Stop at header lines
-    if (SKIP_WORDS.some(s => line.toUpperCase().startsWith(s))) break;
-    if (/^\d/.test(line) || line.indexOf(',') > 0) continue;
-    if (line.length > 2) producerCandidates.unshift(line);
-  }
-  
-  // The last N candidates match the N GRNs (where N = allGRNs.length)
-  const producers = producerCandidates.slice(-allGRNs.length);
-
-  // Step 5: collect qty numbers (after last commodity line)
-  let lastCommPos = 0;
-  lines.forEach((l, i) => { if (/^[A-Z]{2,5},[A-Z0-9]+,/.test(l)) lastCommPos = i; });
-  for (let i = lastCommPos + 1; i < lines.length; i++) {
-    const t = lines[i].replace(/,/g,'');
-    if (/^\d+$/.test(t) && !isDateLine(lines[i])) allNums.push(t);
-  }
-
-  console.log(`   📊 parseStockPdf: grns:${allGRNs.length} comms:${allComms.length} dates:${allDates.length} producers:${producers.length} from ${filename}`);
-
-  // ── Zip everything together ───────────────────────────────────────────────
-  const minLen = Math.min(allGRNs.length, allComms.length);
-  const results = [];
-  let nIdx = 0;
-
-  for (let i = 0; i < minLen; i++) {
-    const grn        = allGRNs[i];
-    const commLine   = allComms[i].replace(/[\\]/g,'').trim();
-    const parts      = commLine.split(',');
-    const commodity  = parts[0] || 'UNK';
-    const variety    = (parts[2] || '*').trim();
-    const count      = (parts[5] || '*').trim();
-    const producer   = producers[i] || '';
-    const arriveDate = allDates[i] || null;
-    const age        = calcAge(arriveDate);
-
-    const rec = parseInt((allNums[nIdx] || '0').replace(/,/g,'')) || 0;
-    nIdx++;
-    let flr = 0;
-    if (nIdx < allNums.length) { flr = extractFLR(allNums[nIdx], rec); nIdx++; }
-
-    if (flr > 0 && commodity && /^[A-Z]/.test(commodity)) {
-      results.push({ grn, producer, commodity, variety, count, flr,
-                     arriveDate, age, stockDate: today, src: filename });
-    }
-  }
-
-  if (results.length > 0) {
-    const withAge = results.filter(r => r.age !== null);
-    if (withAge.length > 0) {
-      const oldest = withAge.reduce((a,b) => b.age > a.age ? b : a);
-      console.log(`   📅 Oldest: ${oldest.producer||oldest.grn} ${oldest.commodity} arrived ${oldest.arriveDate} (${oldest.age}d)`);
-    }
-    const withProd = results.filter(r => r.producer);
-    console.log(`   👤 Producers found: ${withProd.length}/${results.length}`);
-  }
-  return results;
-}let db;
+// ── Firebase & Drive init ─────────────────────────────────────────────────────
+let db;
 function initFirebase() {
   if (db) return;
   const sa = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
@@ -302,50 +209,33 @@ function initDrive() {
   console.log("✅ Google Drive connected");
 }
 
-async function getSnippet(folderId, filename) {
-  const res = await drive.files.list({
-    q: `'${folderId}' in parents and name = '${filename}'`,
-    fields: "files(id,name,contentHints/indexableText)",
-    pageSize: 5,
-  });
-  const snippet = res.data.files?.[0]?.contentHints?.indexableText || "";
-  if (snippet.length > 0) return snippet;
-  // Fallback: download file and extract text
-  const fileId = res.data.files?.[0]?.id;
-  if (!fileId) return "";
-  return await downloadPdfText(fileId);
-}
-
-async function getSnippetById(fileId) {
-  const res = await drive.files.get({
-    fileId,
-    fields: "contentHints/indexableText",
-  });
-  const snippet = res.data?.contentHints?.indexableText || "";
-  if (snippet.length > 0) return snippet;
-  return await downloadPdfText(fileId);
-}
-
-async function downloadPdfText(fileId) {
+// ── Download PDF from Drive to temp file ─────────────────────────────────────
+async function downloadPdfToTemp(fileId, filename) {
+  const tmpPath = path.join(os.tmpdir(), `jdw_${fileId}_${filename}`);
   try {
-    // Download raw PDF bytes
     const res = await drive.files.get(
       { fileId, alt: "media" },
       { responseType: "arraybuffer" }
     );
-    const buffer = Buffer.from(res.data);
-    // Parse PDF and extract text
-    const data = await pdfParse(buffer);
-    console.log(`   📄 PDF extracted: ${data.text.length} chars`);
-    return data.text || "";
+    fs.writeFileSync(tmpPath, Buffer.from(res.data));
+    console.log(`   📥 Downloaded ${filename} (${res.data.byteLength} bytes)`);
+    return tmpPath;
   } catch(e) {
-    console.warn("   ⚠️  PDF parse failed for " + fileId + ": " + e.message);
-    return "";
+    console.warn(`   ⚠️  Download failed for ${filename}: ${e.message}`);
+    return null;
   }
 }
 
+async function getFileId(folderId, filename) {
+  const res = await drive.files.list({
+    q: `'${folderId}' in parents and name = '${filename}'`,
+    fields: "files(id,name)",
+    pageSize: 5,
+  });
+  return res.data.files?.[0]?.id || null;
+}
+
 // ── STOCK SYNC ───────────────────────────────────────────────────────────────
-// Always replaces stock with today's files only. Ignores previous days.
 function todayStr() {
   const d = new Date();
   const dd = String(d.getDate()).padStart(2,"0");
@@ -357,18 +247,15 @@ function todayStr() {
 async function syncStock() {
   console.log("   📦 Checking stock scans...");
   try {
-    const today = todayStr(); // e.g. "26052026"
+    const today = todayStr();
 
-    // List all files in Stock Scans folder
     const res = await drive.files.list({
       q: `'${STOCK_SCANS_FOLDER}' in parents and mimeType = 'application/pdf'`,
       fields: "files(id,name,createdTime)",
       pageSize: 200,
       orderBy: "createdTime desc",
     });
-    const allFiles = res.data.files || [];
-
-    // Keep only files whose name starts with today's date
+    const allFiles   = res.data.files || [];
     const todayFiles = allFiles.filter(f => f.name.startsWith(today));
     console.log(`   📂 Stock Scans: ${allFiles.length} total, ${todayFiles.length} from today (${today})`);
 
@@ -377,20 +264,31 @@ async function syncStock() {
       return;
     }
 
-    // Always reprocess to pick up any parser improvements
     console.log(`   🔄 Processing stock for ${today}...`);
-    // Clear stockDate to force reprocess
-    await db.ref("jdw/stockDate").set(null);
-    await db.ref("jdw/stockFileCount").set(null);
 
-    // Parse all of today's stock PDFs
     let allStock = [];
     for (const file of todayFiles) {
-      const snippet = await getSnippet(STOCK_SCANS_FOLDER, file.name);
-      console.log(`   🔍 snippet(${file.name}): len=${snippet.length} | ${JSON.stringify(snippet.substring(0,200))}`);
-      const rows    = parseStockPdf(snippet, file.name, today);
-      allStock = allStock.concat(rows);
-      console.log(`   ✅ ${file.name} → ${rows.length} stock lines`);
+      // Download PDF to temp file
+      const tmpPath = await downloadPdfToTemp(file.id, file.name);
+      if (!tmpPath) continue;
+
+      try {
+        // Detect user from filename
+        const base = file.name.toLowerCase().replace(".pdf","");
+        let user = "unknown";
+        if (base.includes("pot") || base.includes("riaan")) user = "RJ";
+        else if (base.includes("cdw")) user = "CW";
+
+        // Parse with spatial parser
+        const rows = await parsePdfSpatial(tmpPath, file.name, today);
+        // Tag each row with user
+        rows.forEach(r => r.user = user);
+        allStock = allStock.concat(rows);
+        console.log(`   ✅ ${file.name} → ${rows.length} stock lines (user=${user})`);
+      } finally {
+        // Clean up temp file
+        try { fs.unlinkSync(tmpPath); } catch {}
+      }
     }
 
     if (allStock.length === 0) {
@@ -398,7 +296,7 @@ async function syncStock() {
       return;
     }
 
-    // Push to Firebase — completely replaces previous stock
+    // Push to Firebase — replaces stock for today
     await db.ref("jdw").update({
       stock:          allStock,
       stockDate:      today,
@@ -406,7 +304,26 @@ async function syncStock() {
       stockUpdated:   new Date().toISOString(),
     });
 
-    // Log it
+    // Also write to /stock/ path for PWA compatibility
+    const stockByUser = {};
+    allStock.forEach((e, i) => {
+      const u = e.user || "RJ";
+      if (!stockByUser[u]) stockByUser[u] = {};
+      const id = `${today}_${i}`;
+      stockByUser[u][id] = {
+        id, user: u,
+        date:      e.arriveDate || today,
+        producer:  e.producer  || "",
+        grn:       e.grn       || "",
+        commodity: e.commodity || "",
+        qty_rec:   e.rec       || 0,
+        qty_sort:  e.flr       || 0,
+        source:    "drive",
+        uploadedAt: new Date().toISOString(),
+      };
+    });
+    await db.ref("stock").set(stockByUser);
+
     const logSnap = await db.ref("jdw/log").once("value");
     const log = Array.isArray(logSnap.val()) ? logSnap.val() : [];
     log.push({ ts: new Date().toLocaleTimeString("en-ZA"), user:"AUTO-SYNC", msg:`📦 Stock updated: ${allStock.length} lines from ${todayFiles.length} PDFs (${today})` });
@@ -418,7 +335,7 @@ async function syncStock() {
   }
 }
 
-// ── BUYER HISTORY SYNC ───────────────────────────────────────────────────────
+// ── BUYER HISTORY SYNC (unchanged) ───────────────────────────────────────────
 async function syncBuyerHistory() {
   console.log("   🧾 Checking buyer history...");
   try {
@@ -444,7 +361,12 @@ async function syncBuyerHistory() {
     let newRows = [];
     for (const file of newFiles) {
       try {
-        const snippet = await getSnippet(BUYER_HISTORY_FOLDER, file.name);
+        // Download and get text for buyer slips (still use Drive indexable text)
+        const fileRes = await drive.files.get({
+          fileId: file.id,
+          fields: "contentHints/indexableText",
+        });
+        const snippet = fileRes.data?.contentHints?.indexableText || "";
         const rows    = parseSlip(snippet, file.name);
         newRows = newRows.concat(rows);
         processed[file.id] = new Date().toISOString();
@@ -461,7 +383,7 @@ async function syncBuyerHistory() {
     const model    = buildModel(updated);
 
     await db.ref("jdw").update({
-      history, model, processedFiles: processed,
+      history: updated, model, processedFiles: processed,
       lastSync: { ts: new Date().toISOString(), newRows: toAdd.length, total: updated.length, buyers: Object.keys(model).length },
     });
 
@@ -483,7 +405,6 @@ async function sync() {
     initFirebase();
     initDrive();
 
-    // Seed buyer history if empty
     const histSnap = await db.ref("jdw/history").once("value");
     let history = histSnap.val();
     if (!history || (Array.isArray(history) && history.length === 0)) {
@@ -493,7 +414,6 @@ async function sync() {
       console.log(`   ✅ Seeded ${SEED_HISTORY.length} transactions`);
     }
 
-    // Run both syncs
     await syncBuyerHistory();
     await syncStock();
 
@@ -505,6 +425,6 @@ async function sync() {
 // ── Keep-alive server ────────────────────────────────────────────────────────
 http.createServer((req, res) => res.end("jdw-sync alive")).listen(process.env.PORT || 3000);
 
-console.log(`🚀 jdw-sync v2 starting — polling every ${POLL_MINUTES} min`);
+console.log(`🚀 jdw-sync v3 starting — polling every ${POLL_MINUTES} min`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
