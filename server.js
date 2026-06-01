@@ -187,3 +187,56 @@ app.get('/', (_req, res) => res.send('jdw-sync alive'));
 // Start
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`jdw-sync listening on :${PORT}`));
+
+// Built-in upload page — same domain, no CORS issues
+app.get('/upload', (_req, res) => {
+  res.send(`<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>JDW Stock Upload</title>
+<style>
+body{font-family:sans-serif;max-width:500px;margin:40px auto;padding:16px;background:#0f1520;color:#c8d8e8}
+h2{color:#7aeab4;margin-bottom:20px}
+.box{background:#1a2232;border-radius:12px;padding:20px}
+label{display:block;margin-bottom:8px;font-size:14px;color:#8ab0d0}
+input[type=file]{color:#c8d8e8;width:100%;margin-bottom:16px;font-size:14px}
+button{width:100%;padding:14px;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:10px}
+.u{background:#2e7df7;color:#fff}
+.c{background:#c0392b;color:#fff}
+#st{margin-top:12px;font-size:14px;min-height:1.4em}
+</style>
+</head>
+<body>
+<h2>JDW Stock Upload</h2>
+<div class="box">
+  <label>Select PDF — POT.pdf=Riaan, CDW.pdf=Christoff, riaan.pdf=Riaan</label>
+  <input type="file" id="f" accept=".pdf"/>
+  <button class="u" onclick="go(false)">Upload</button>
+  <button class="c" onclick="go(true)">🔄 Clear & Re-upload</button>
+  <div id="st"></div>
+</div>
+<script>
+async function go(clear){
+  const f=document.getElementById('f').files[0];
+  const s=document.getElementById('st');
+  if(!f){s.textContent='Choose a PDF first';return;}
+  s.style.color='#8ab0d0';
+  s.textContent=clear?'Clearing & uploading...':'Uploading...';
+  const form=new FormData();
+  form.append('pdf',f,f.name);
+  try{
+    const r=await fetch('/'+(clear?'clear-and-upload':'upload-stock'),{method:'POST',body:form});
+    const d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Failed');
+    s.style.color='#7aeab4';
+    s.textContent='Done! '+d.count+' entries loaded for '+d.user;
+  }catch(e){
+    s.style.color='#ff6b6b';
+    s.textContent='Error: '+e.message;
+  }
+}
+</script>
+</body>
+</html>`);
+});
