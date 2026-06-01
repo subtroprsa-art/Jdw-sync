@@ -33,14 +33,12 @@ const db = admin.database();
 const app    = express();
 const upload = multer({ dest: os.tmpdir() });
 app.use(cors({
-  origin: [
-    'https://subtroprsa-art.github.io',
-    'https://cdjcrm.netlify.app',
-    'https://shimmering-banoffee-ba1043.netlify.app',
-    /\.netlify\.app$/,
-    /\.github\.io$/,
-  ]
+  origin: true,   // allow all origins
+  methods: ['GET','POST','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: false,
 }));
+app.options('*', cors());  // handle preflight for all routes
 app.use(express.json());
 
 // ── Filename → user + date ────────────────────────────────────────────────────
