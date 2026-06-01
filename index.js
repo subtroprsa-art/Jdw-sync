@@ -149,6 +149,7 @@ function parsePdfSpatial(pdfPath, filename, today) {
       console.warn("   ⚠️  parse_stock_pdf.py not found");
       return resolve([]);
     }
+    // Pass --debug flag to get column position info
     execFile("python3", [PARSER_SCRIPT, pdfPath, "", today || ""],
       { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
@@ -206,14 +207,15 @@ function initDrive() {
 
 // ── Download PDF from Drive to temp file ─────────────────────────────────────
 async function downloadPdfToTemp(fileId, filename) {
-  const tmpPath = path.join(os.tmpdir(), `jdw_${fileId}_${filename}`);
+  const tmpPath = path.join(os.tmpdir(), filename); // keep original filename
   try {
     const res = await drive.files.get(
       { fileId, alt: "media" },
       { responseType: "arraybuffer" }
     );
-    fs.writeFileSync(tmpPath, Buffer.from(res.data));
-    console.log(`   📥 Downloaded ${filename} (${res.data.byteLength} bytes)`);
+    const buf = Buffer.from(res.data);
+    fs.writeFileSync(tmpPath, buf);
+    console.log(`   📥 Downloaded ${filename} (${buf.length} bytes)`);
     return tmpPath;
   } catch(e) {
     console.warn(`   ⚠️  Download failed for ${filename}: ${e.message}`);
