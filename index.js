@@ -1,26 +1,27 @@
 /**
- * jdw-sync v3
+ * jdw-sync v4
  * - Buyer History: watches folder, adds new slips incrementally
- * - Stock Scans: watches folder, always uses ONLY the latest day's PDFs
- *   Uses parse_stock_pdf.py (pdfplumber spatial parser) instead of pdf-parse
+ * - Stock Scans: watches folder every 5 min + instant /trigger-stock endpoint
+ *   Uses parse_stock_pdf.py (pdfplumber spatial parser)
  */
 
-const { google }  = require("googleapis");
-const admin       = require("firebase-admin");
-const cron        = require("node-cron");
-const http        = require("http");
+const { google }   = require("googleapis");
+const admin        = require("firebase-admin");
+const cron         = require("node-cron");
+const http         = require("http");
 const { execFile } = require("child_process");
-const fs          = require("fs");
-const os          = require("os");
-const path        = require("path");
+const fs           = require("fs");
+const os           = require("os");
+const path         = require("path");
 
 const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
 const STOCK_SCANS_FOLDER   = process.env.DRIVE_STOCK_SCANS_FOLDER_ID   || "1DrYmim6xThu6KfKRplr5SDBVZc-BFMBm";
 const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
 const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
 const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
+const TRIGGER_SECRET       = process.env.TRIGGER_SECRET || "jdw-trigger-2026";
 
-// ── Seed history (base data) ─────────────────────────────────────────────────
+// ── Seed history ─────────────────────────────────────────────────────────────
 const SEED_HISTORY = [
   { buyer:"MANDELA MARKET",       grn:"15379866", commodity:"AVOS", variety:"AK", count:"8",  qty:30,  price:50,  date:"26/05/2026" },
   { buyer:"MANDELA MARKET",       grn:"15379857", commodity:"AVOS", variety:"AK", count:"10", qty:10,  price:50,  date:"26/05/2026" },
@@ -60,7 +61,7 @@ const SEED_HISTORY = [
   { buyer:"GO FRESH HOSPITALITY", grn:"15400623", commodity:"STRS", variety:"*",  count:"16", qty:8,   price:640, date:"05/05/2026" },
 ];
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 function parseJSON(envVar, name) {
   try {
     let raw = (process.env[envVar] || "").trim();
@@ -97,15 +98,12 @@ function buildModel(history) {
   return m;
 }
 
-// ── Slip PDF parser (Python subprocess) ──────────────────────────────────────
+// ── Slip PDF parser ───────────────────────────────────────────────────────────
 const SLIP_PARSER_SCRIPT = path.join(__dirname, "parse_slip_pdf.py");
 
 function parseSlipPdf(pdfPath, filename) {
   return new Promise((resolve) => {
-    if (!fs.existsSync(SLIP_PARSER_SCRIPT)) {
-      console.warn("   ⚠️  parse_slip_pdf.py not found");
-      return resolve([]);
-    }
+    if (!fs.existsSync(SLIP_PARSER_SCRIPT)) { console.warn("   ⚠️  parse_slip_pdf.py not found"); return resolve([]); }
     execFile("python3", [SLIP_PARSER_SCRIPT, pdfPath],
       { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
@@ -114,50 +112,33 @@ function parseSlipPdf(pdfPath, filename) {
         try {
           const rows = JSON.parse(stdout);
           if (!Array.isArray(rows)) return resolve([]);
-          const results = rows
-            .filter(r => r.buyer && r.grn && r.qty > 0)
-            .map(r => ({
-              buyer:     r.buyer,
-              account:   r.account   || '',
-              card:      r.card      || '',
-              grn:       r.grn,
-              invoice:   r.invoice   || '',
-              commodity: r.commodity || 'UNK',
-              variety:   r.variety   || '*',
-              cls:       r.cls       || '1',
-              size:      r.size      || '*',
-              qty:       r.qty,
-              price:     r.price,
-              total:     r.total,
-              date:      r.date,
-              src:       filename,
-            }));
+          const results = rows.filter(r => r.buyer && r.grn && r.qty > 0).map(r => ({
+            buyer:r.buyer, account:r.account||'', card:r.card||'', grn:r.grn,
+            invoice:r.invoice||'', commodity:r.commodity||'UNK', variety:r.variety||'*',
+            cls:r.cls||'1', size:r.size||'*', qty:r.qty, price:r.price,
+            total:r.total, date:r.date, src:filename,
+          }));
           console.log(`   ✅ Slip parser: ${results.length} rows from ${filename}`);
           resolve(results);
-        } catch(e) {
-          console.error(`   ❌ Slip JSON parse error: ${e.message}`);
-          resolve([]);
-        }
+        } catch(e) { console.error(`   ❌ Slip JSON parse error: ${e.message}`); resolve([]); }
       }
     );
   });
 }
 
-// ── Buyer slip parser (legacy fallback) ──────────────────────────────────────
 function parseCommodityLine(line) {
   line = (line || "").toUpperCase();
   let commodity = "UNK", variety = "*", count = "*";
-  if      (line.includes("AVOCADO"))  commodity = "AVOS";
-  else if (line.includes("LEMON"))    commodity = "LEMS";
+  if      (line.includes("AVOCADO"))    commodity = "AVOS";
+  else if (line.includes("LEMON"))      commodity = "LEMS";
   else if (line.includes("NAARTJ") || line.includes("HAARTJ")) commodity = "NAAR";
-  else if (line.includes("ORANGE"))   commodity = "ORGS";
+  else if (line.includes("ORANGE"))     commodity = "ORGS";
   else if (line.includes("CLEMENTINE")) commodity = "CLTM";
-  else if (line.includes("KIWI"))     commodity = "KIWI";
-  else if (line.includes("STRAWB"))   commodity = "STRS";
-  else if (line.includes("FIG"))      commodity = "FIGS";
-  else if (line.includes("GUAVA"))    commodity = "GVS";
-  else if (line.includes("DRAGON"))   commodity = "DRAG";
-  else if (line.includes("SATSUM"))   commodity = "NAAR";
+  else if (line.includes("KIWI"))       commodity = "KIWI";
+  else if (line.includes("STRAWB"))     commodity = "STRS";
+  else if (line.includes("FIG"))        commodity = "FIGS";
+  else if (line.includes("GUAVA"))      commodity = "GVS";
+  else if (line.includes("DRAGON"))     commodity = "DRAG";
   const varMatch = line.match(/\b(AF|AH|AK|MA|LR|HM|NV|M1|AE)\b/);
   if (varMatch) variety = varMatch[1];
   const cntMatch = line.match(/;(\d+|1X{1,3}|[LMSX]+);/);
@@ -188,13 +169,10 @@ function parseSlip(snippet, filename) {
   return rows;
 }
 
-// ── Spatial PDF parser (Python subprocess) ───────────────────────────────────
+// ── Spatial stock PDF parser (pdfplumber) ─────────────────────────────────────
 function parsePdfSpatial(pdfPath, filename, today) {
   return new Promise((resolve) => {
-    if (!fs.existsSync(PARSER_SCRIPT)) {
-      console.warn("   ⚠️  parse_stock_pdf.py not found");
-      return resolve([]);
-    }
+    if (!fs.existsSync(PARSER_SCRIPT)) { console.warn("   ⚠️  parse_stock_pdf.py not found"); return resolve([]); }
     execFile("python3", [PARSER_SCRIPT, pdfPath, "", today || ""],
       { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
@@ -209,7 +187,10 @@ function parsePdfSpatial(pdfPath, filename, today) {
               grn:        String(r.grn        || ""),
               producer:   String(r.producer   || ""),
               commodity:  String(r.commodity  || "UNK"),
+              pack:       String(r.pack       || ""),
               variety:    String(r.variety    || "*"),
+              grade:      String(r.grade      || "1"),
+              size:       String(r.size       || "*"),
               count:      String(r.count      || "*"),
               flr:        Number(r.qty_sort)  || 0,
               rec:        Number(r.qty_rec)   || 0,
@@ -220,10 +201,7 @@ function parsePdfSpatial(pdfPath, filename, today) {
             .filter(r => r.grn || r.producer);
           console.log(`   ✅ Spatial parser: ${results.length} rows from ${filename}`);
           resolve(results);
-        } catch(e) {
-          console.error(`   ❌ JSON parse error: ${e.message}`);
-          resolve([]);
-        }
+        } catch(e) { console.error(`   ❌ JSON parse error: ${e.message}`); resolve([]); }
       }
     );
   });
@@ -248,14 +226,11 @@ function initDrive() {
   console.log("✅ Google Drive connected");
 }
 
-// ── Download PDF from Drive to temp file ─────────────────────────────────────
+// ── Download PDF from Drive ───────────────────────────────────────────────────
 async function downloadPdfToTemp(fileId, filename) {
   const tmpPath = path.join(os.tmpdir(), filename);
   try {
-    const res = await drive.files.get(
-      { fileId, alt: "media" },
-      { responseType: "arraybuffer" }
-    );
+    const res = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
     const buf = Buffer.from(res.data);
     fs.writeFileSync(tmpPath, buf);
     console.log(`   📥 Downloaded ${filename} (${buf.length} bytes)`);
@@ -266,107 +241,99 @@ async function downloadPdfToTemp(fileId, filename) {
   }
 }
 
-// ── STOCK SYNC ───────────────────────────────────────────────────────────────
+// ── Process a single stock file and push to Firebase ─────────────────────────
+async function processStockFile(fileId, filename) {
+  const base = filename.toLowerCase().replace(".pdf","");
+  let user = "unknown";
+  if      (base.includes("riaan")) user = "RJ";
+  else if (base.includes("cdw"))   user = "CW";
+  else if (base.includes("pot"))   user = "POT";
+
+  // Extract date from filename e.g. 03062026cdw.pdf → 03062026
+  const dateMatch = filename.match(/^(\d{8})/);
+  const today = dateMatch ? dateMatch[1] : todayStr();
+
+  const tmpPath = await downloadPdfToTemp(fileId, filename);
+  if (!tmpPath) throw new Error("Download failed");
+
+  let rows = [];
+  try {
+    rows = await parsePdfSpatial(tmpPath, filename, today);
+    rows.forEach(r => r.user = user);
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
+
+  if (rows.length === 0) {
+    console.log(`   ⚠️  No rows parsed from ${filename}`);
+    return 0;
+  }
+
+  // Build Firebase payload keyed by GRN
+  const stockByGrn = {};
+  rows.forEach(r => {
+    stockByGrn[r.grn] = {
+      grn:        r.grn,
+      producer:   r.producer,
+      commodity:  r.commodity,
+      pack:       r.pack       || "",
+      variety:    r.variety    || "*",
+      grade:      r.grade      || "1",
+      size:       r.size       || "*",
+      count:      r.count      || "*",
+      qty_rec:    r.rec        || 0,
+      qty_sort:   r.flr        || 0,
+      date:       r.arriveDate || today,
+      user:       user,
+      source:     "drive",
+      uploadedAt: new Date().toISOString(),
+    };
+  });
+
+  // PUT replaces the salesman's entire stock with this file's data
+  await db.ref(`stock/${user}`).set(stockByGrn);
+  console.log(`   ✅ Stock pushed: /stock/${user} — ${rows.length} rows from ${filename}`);
+  return rows.length;
+}
+
+// ── STOCK SYNC (polling — processes any unprocessed files) ────────────────────
 function todayStr() {
   const d = new Date();
-  const dd = String(d.getDate()).padStart(2,"0");
-  const mm = String(d.getMonth()+1).padStart(2,"0");
-  const yyyy = d.getFullYear();
-  return dd + mm + yyyy;
+  return String(d.getDate()).padStart(2,"0") + String(d.getMonth()+1).padStart(2,"0") + d.getFullYear();
 }
+
+// Track processed file IDs in memory (resets on server restart — that's fine)
+const processedStockFiles = new Set();
 
 async function syncStock() {
   console.log("   📦 Checking stock scans...");
   try {
-    const today = todayStr();
-
     const res = await drive.files.list({
       q: `'${STOCK_SCANS_FOLDER}' in parents and mimeType = 'application/pdf'`,
       fields: "files(id,name,createdTime)",
       pageSize: 200,
-      orderBy: "createdTime desc",
+      orderBy: "createdTime asc",  // oldest first so newest wins
     });
-    const allFiles   = res.data.files || [];
-    const todayFiles = allFiles.filter(f => f.name.startsWith(today));
-    console.log(`   📂 Stock Scans: ${allFiles.length} total, ${todayFiles.length} from today (${today})`);
+    const allFiles  = res.data.files || [];
+    const newFiles  = allFiles.filter(f => !processedStockFiles.has(f.id));
 
-    if (todayFiles.length === 0) {
-      console.log("   ⚠️  No stock files for today yet — keeping previous stock");
-      return;
-    }
+    if (newFiles.length === 0) { console.log("   ✅ No new stock files"); return; }
+    console.log(`   🔄 Processing ${newFiles.length} new stock file(s)...`);
 
-    console.log(`   🔄 Processing stock for ${today}...`);
-
-    let allStock = [];
-    for (const file of todayFiles) {
-      const tmpPath = await downloadPdfToTemp(file.id, file.name);
-      if (!tmpPath) continue;
-
+    for (const file of newFiles) {
       try {
-        // ── FIX: correct user detection ──────────────────────────────────────
-        const base = file.name.toLowerCase().replace(".pdf","");
-        let user = "unknown";
-        if      (base.includes("riaan")) user = "RJ";
-        else if (base.includes("cdw"))   user = "CW";
-        else if (base.includes("pot"))   user = "POT";
-        // ─────────────────────────────────────────────────────────────────────
-
-        const rows = await parsePdfSpatial(tmpPath, file.name, today);
-        rows.forEach(r => r.user = user);
-        allStock = allStock.concat(rows);
-      } finally {
-        try { fs.unlinkSync(tmpPath); } catch {}
+        await processStockFile(file.id, file.name);
+        processedStockFiles.add(file.id);
+      } catch(e) {
+        console.error(`   ❌ ${file.name}: ${e.message}`);
       }
     }
-
-    if (allStock.length === 0) {
-      console.log("   ⚠️  Could not parse stock lines from today's PDFs");
-      return;
-    }
-
-    await db.ref("jdw").update({
-      stock:          allStock,
-      stockDate:      today,
-      stockFileCount: todayFiles.length,
-      stockUpdated:   new Date().toISOString(),
-    });
-
-    const stockByUser = {};
-    allStock.forEach((e, i) => {
-      const u = e.user || "RJ";
-      if (!stockByUser[u]) stockByUser[u] = {};
-      const id = `${today}_${i}`;
-      stockByUser[u][id] = {
-        id, user: u,
-        date:      e.arriveDate || today,
-        producer:  e.producer   || "",
-        grn:       e.grn        || "",
-        commodity: e.commodity  || "",
-        pack:      e.pack       || "",   // e.g. TR040, BG150, CTT150
-        variety:   e.variety    || "*",
-        grade:     e.grade      || "1",  // 1 = CL1, 2 = CL2
-        size:      e.count      || "*",  // count field holds the size e.g. 14, 16
-        count:     e.count      || "*",  // keep for backwards compat
-        qty_rec:   e.rec        || 0,
-        qty_sort:  e.flr        || 0,
-        source:    "drive",
-        uploadedAt: new Date().toISOString(),
-      };
-    });
-    await db.ref("stock").set(stockByUser);
-
-    const logSnap = await db.ref("jdw/log").once("value");
-    const log = Array.isArray(logSnap.val()) ? logSnap.val() : [];
-    log.push({ ts: new Date().toLocaleTimeString("en-ZA"), user:"AUTO-SYNC", msg:`📦 Stock updated: ${allStock.length} lines from ${todayFiles.length} PDFs (${today})` });
-    await db.ref("jdw/log").set(log.slice(-100));
-
-    console.log(`   ✅ Stock pushed: ${allStock.length} lines from ${todayFiles.length} files`);
   } catch(e) {
     console.error("   ❌ Stock sync error:", e.message);
   }
 }
 
-// ── BUYER HISTORY SYNC ───────────────────────────────────────────────────────
+// ── BUYER HISTORY SYNC ────────────────────────────────────────────────────────
 async function syncBuyerHistory() {
   console.log("   🧾 Checking buyer history...");
   try {
@@ -379,10 +346,9 @@ async function syncBuyerHistory() {
       pageSize: 200,
       orderBy: "createdTime desc",
     });
-    const allFiles  = res.data.files || [];
-    const newFiles  = allFiles.filter(f => !processed[f.id]);
+    const allFiles = res.data.files || [];
+    const newFiles = allFiles.filter(f => !processed[f.id]);
     console.log(`   📂 Buyer History: ${allFiles.length} total, ${newFiles.length} new`);
-
     if (newFiles.length === 0) { console.log("   ✅ No new slips"); return; }
 
     const histSnap = await db.ref("jdw/history").once("value");
@@ -393,25 +359,18 @@ async function syncBuyerHistory() {
     for (const file of newFiles) {
       let tmpPath = null;
       try {
-        // Download PDF and parse with OCR parser
         tmpPath = await downloadPdfToTemp(file.id, file.name);
         let rows = [];
-        if (tmpPath) {
-          rows = await parseSlipPdf(tmpPath, file.name);
-        }
-        // Fallback to indexableText if parser returns nothing
+        if (tmpPath) rows = await parseSlipPdf(tmpPath, file.name);
         if (rows.length === 0) {
           console.warn(`   ⚠️  OCR parser got 0 rows for ${file.name}, trying indexableText`);
-          const fileRes = await drive.files.get({
-            fileId: file.id,
-            fields: "contentHints/indexableText",
-          });
+          const fileRes = await drive.files.get({ fileId: file.id, fields: "contentHints/indexableText" });
           const snippet = fileRes.data?.contentHints?.indexableText || "";
           rows = parseSlip(snippet, file.name);
         }
         newRows = newRows.concat(rows);
         processed[file.id] = new Date().toISOString();
-        console.log(`   ✅ ${file.name} → ${rows.length} rows (${rows[0]?.buyer || "?"})`);
+        console.log(`   ✅ ${file.name} → ${rows.length} rows`);
       } catch(e) {
         console.warn(`   ⚠️  ${file.name}: ${e.message}`);
         processed[file.id] = "error";
@@ -435,13 +394,13 @@ async function syncBuyerHistory() {
     log.push({ ts: new Date().toLocaleTimeString("en-ZA"), user:"AUTO-SYNC", msg:`📥 ${toAdd.length} new tx · ${updated.length} total · ${Object.keys(model).length} buyers` });
     await db.ref("jdw/log").set(log.slice(-100));
 
-    console.log(`   ✅ Buyer history: ${toAdd.length} new rows | ${updated.length} total | ${Object.keys(model).length} buyers`);
+    console.log(`   ✅ Buyer history: ${toAdd.length} new rows | ${updated.length} total`);
   } catch(e) {
     console.error("   ❌ Buyer history sync error:", e.message);
   }
 }
 
-// ── MAIN SYNC ────────────────────────────────────────────────────────────────
+// ── MAIN SYNC ─────────────────────────────────────────────────────────────────
 async function sync() {
   console.log(`\n[${new Date().toISOString()}] 🔄 Sync started`);
   try {
@@ -459,15 +418,68 @@ async function sync() {
 
     await syncBuyerHistory();
     await syncStock();
-
   } catch(err) {
     console.error("❌ Sync error:", err.message);
   }
 }
 
-// ── Keep-alive server ────────────────────────────────────────────────────────
-http.createServer((req, res) => res.end("jdw-sync alive")).listen(process.env.PORT || 3000);
+// ── HTTP SERVER — keep-alive + /trigger-stock endpoint ────────────────────────
+const server = http.createServer(async (req, res) => {
+  // Health check
+  if (req.method === "GET" && req.url === "/") {
+    return res.end("jdw-sync alive");
+  }
 
-console.log(`🚀 jdw-sync v3 starting — polling every ${POLL_MINUTES} min`);
+  // Trigger endpoint — called by Apps Script when new stock PDF detected
+  // POST /trigger-stock
+  // Body: { secret, fileId, filename }
+  if (req.method === "POST" && req.url === "/trigger-stock") {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", async () => {
+      try {
+        const { secret, fileId, filename } = JSON.parse(body);
+
+        if (secret !== TRIGGER_SECRET) {
+          res.writeHead(403);
+          return res.end(JSON.stringify({ error: "Unauthorized" }));
+        }
+
+        if (!fileId || !filename) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ error: "fileId and filename required" }));
+        }
+
+        console.log(`\n📡 Trigger received: ${filename} (${fileId})`);
+
+        // Respond immediately so Apps Script doesn't time out
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "processing", filename }));
+
+        // Process in background
+        try {
+          initFirebase();
+          initDrive();
+          const count = await processStockFile(fileId, filename);
+          processedStockFiles.add(fileId);
+          console.log(`   ✅ Trigger complete: ${filename} → ${count} rows`);
+        } catch(e) {
+          console.error(`   ❌ Trigger processing error: ${e.message}`);
+        }
+
+      } catch(e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
+      }
+    });
+    return;
+  }
+
+  res.writeHead(404);
+  res.end("Not found");
+});
+
+server.listen(process.env.PORT || 3000);
+console.log(`🚀 jdw-sync v4 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
