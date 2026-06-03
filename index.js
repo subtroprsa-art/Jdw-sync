@@ -108,31 +108,10 @@ function buildModel(history) {
 }
 
 // ── Slip PDF parser ───────────────────────────────────────────────────────────
-const SLIP_PARSER_SCRIPT = path.join(__dirname, "parse_slip_pdf.py");
-
+// Buyer slips are handled by Apps Script (processNewSlips) — not by Render.
+// This function is kept as a stub to avoid errors.
 function parseSlipPdf(pdfPath, filename) {
-  return new Promise((resolve) => {
-    if (!fs.existsSync(SLIP_PARSER_SCRIPT)) { console.warn("   ⚠️  parse_slip_pdf.py not found"); return resolve([]); }
-    execFile("python3", [SLIP_PARSER_SCRIPT, pdfPath],
-      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (stderr) console.warn(`   ⚠️  slip parser stderr: ${stderr.trim().slice(0,200)}`);
-        if (err) { console.error(`   ❌ Slip parser error: ${err.message}`); return resolve([]); }
-        try {
-          const rows = JSON.parse(stdout);
-          if (!Array.isArray(rows)) return resolve([]);
-          const results = rows.filter(r => r.buyer && r.grn && r.qty > 0).map(r => ({
-            buyer:r.buyer, account:r.account||'', card:r.card||'', grn:r.grn,
-            invoice:r.invoice||'', commodity:r.commodity||'UNK', variety:r.variety||'*',
-            cls:r.cls||'1', size:r.size||'*', qty:r.qty, price:r.price,
-            total:r.total, date:r.date, src:filename,
-          }));
-          console.log(`   ✅ Slip parser: ${results.length} rows from ${filename}`);
-          resolve(results);
-        } catch(e) { console.error(`   ❌ Slip JSON parse error: ${e.message}`); resolve([]); }
-      }
-    );
-  });
+  return Promise.resolve([]);
 }
 
 function parseCommodityLine(line) {
@@ -425,7 +404,7 @@ async function sync() {
       console.log(`   ✅ Seeded ${SEED_HISTORY.length} transactions`);
     }
 
-    await syncBuyerHistory();
+    // Buyer history is handled by Apps Script (processNewSlips) — not here
     await syncStock();
   } catch(err) {
     console.error("❌ Sync error:", err.message);
