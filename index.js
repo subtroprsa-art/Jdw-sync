@@ -80,20 +80,29 @@ function buildModel(history) {
   const m = {};
   for (const h of history) {
     const b = h.buyer;
-    const k = [h.commodity, h.variety, h.count].filter(v => v && v !== "*").join("|");
+    if (!b) continue;
+    // Sanitise all fields — Firebase rejects undefined values
+    const commodity = h.commodity || 'UNK';
+    const variety   = h.variety   || '*';
+    const count     = h.count     || h.size || '*';
+    const qty       = Number(h.qty)   || 0;
+    const price     = Number(h.price) || 0;
+    const date      = h.date || '';
+
+    const k = [commodity, variety, count].filter(v => v && v !== "*").join("|");
     if (!m[b]) m[b] = {};
-    if (!m[b][k]) m[b][k] = { totalQty:0, txCount:0, priceSum:0, lastDate:"", commodity:h.commodity, variety:h.variety, count:h.count };
-    m[b][k].totalQty += h.qty;
+    if (!m[b][k]) m[b][k] = { totalQty:0, txCount:0, priceSum:0, lastDate:"", commodity, variety, count };
+    m[b][k].totalQty += qty;
     m[b][k].txCount  += 1;
-    m[b][k].priceSum += h.price * h.qty;
-    if (!m[b][k].lastDate || h.date > m[b][k].lastDate) m[b][k].lastDate = h.date;
+    m[b][k].priceSum += price * qty;
+    if (!m[b][k].lastDate || date > m[b][k].lastDate) m[b][k].lastDate = date;
   }
   for (const b of Object.keys(m))
     for (const k of Object.keys(m[b])) {
       const e = m[b][k];
-      e.avgPrice = e.priceSum / e.totalQty;
+      e.avgPrice = e.totalQty > 0 ? e.priceSum / e.totalQty : 0;
       e.score    = e.txCount * Math.log1p(e.totalQty);
-      e.avgQty   = Math.round(e.totalQty / e.txCount);
+      e.avgQty   = e.txCount > 0 ? Math.round(e.totalQty / e.txCount) : 0;
     }
   return m;
 }
