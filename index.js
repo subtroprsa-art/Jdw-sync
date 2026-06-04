@@ -286,7 +286,7 @@ async function notifyBuyers(newStockRows, user) {
 
     // ⚠️  TEST MODE — redirect all notifications to one number
     // Remove this block when going live
-    const TEST_NUMBER = "+27673972793";
+    const TEST_NUMBER = "+27845164717";
     for (const key of Object.keys(phoneMap)) phoneMap[key] = TEST_NUMBER;
     console.log("   🧪 TEST MODE — all notifications redirected to " + TEST_NUMBER);
 
