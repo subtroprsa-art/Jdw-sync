@@ -21,16 +21,16 @@ const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
 const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
 const TRIGGER_SECRET       = process.env.TRIGGER_SECRET || "jdw-trigger-2026";
 
-// Twilio credentials
-const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID  || "ACf1c578a5fce1c345d9bd42984cbcd34c";
-const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN    || "ba462ea910adeddb8d1d9e1a0e1475ad";
+// Twilio credentials — loaded from Render environment variables only
+const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
 const TWILIO_FROM  = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
 
 // Salesman contact numbers for the message
 const SALESMAN_PHONES = {
-  RJ:  "Riaan 084-516-4717",
-  CW:  "Christoff 082-418-6030",
-  POT: "George 082-418-6030",
+  RJ:  "Riaan 082-xxx-xxxx",
+  CW:  "Christoff 082-xxx-xxxx",
+  POT: "George 082-xxx-xxxx",
 };
 
 // Commodity full names
