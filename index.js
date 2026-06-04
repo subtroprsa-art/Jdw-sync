@@ -1,14 +1,14 @@
 /**
- * jdw-sync v4
- * - Buyer History: watches folder, adds new slips incrementally
+ * jdw-sync v5
  * - Stock Scans: watches folder every 5 min + instant /trigger-stock endpoint
- *   Uses parse_stock_pdf.py (pdfplumber spatial parser)
+ * - WhatsApp notifications via Twilio when stock matches buyer preferences 80%+
  */
 
 const { google }   = require("googleapis");
 const admin        = require("firebase-admin");
 const cron         = require("node-cron");
 const http         = require("http");
+const https        = require("https");
 const { execFile } = require("child_process");
 const fs           = require("fs");
 const os           = require("os");
@@ -20,6 +20,36 @@ const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
 const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
 const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
 const TRIGGER_SECRET       = process.env.TRIGGER_SECRET || "jdw-trigger-2026";
+
+// Twilio credentials
+const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID  || "ACf1c578a5fce1c345d9bd42984cbcd34c";
+const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN    || "ba462ea910adeddb8d1d9e1a0e1475ad";
+const TWILIO_FROM  = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
+
+// Salesman contact numbers for the message
+const SALESMAN_PHONES = {
+  RJ:  "Riaan 082-xxx-xxxx",
+  CW:  "Christoff 082-xxx-xxxx",
+  POT: "George 082-xxx-xxxx",
+};
+
+// Commodity full names
+const COMM_NAMES = {
+  AVOS:"Avocados", LEMS:"Lemons", FIGS:"Figs", KIWI:"Kiwifruit",
+  ORGS:"Oranges", GVS:"Guavas", CLTM:"Clementines", NAAR:"Naartjies",
+  STRS:"Strawberries", MANG:"Mangoes", DRAG:"Dragon Fruit", GFT:"Grapefruit",
+  SATS:"Satsumas", PAPO:"Papino",
+};
+
+const VARIETY_NAMES = {
+  AF:"Fuerte", AH:"Hass", AK:"Pinkerton", MA:"Maluma", MD:"Dusa", NV:"Navel",
+};
+
+const PACK_NAMES = {
+  TR040:"4KG Tray", BG150:"15KG Bag", BG160:"16KG Bag",
+  CTT150:"15KG Carton", PTB005:"500G Punnet", PTB002:"160G Punnet",
+  DL076:"DL 076 Carton", PC030:"3KG Pocket", PC060:"6KG Pocket",
+};
 
 // ── Seed history ─────────────────────────────────────────────────────────────
 const SEED_HISTORY = [
@@ -35,60 +65,44 @@ const SEED_HISTORY = [
   { buyer:"PAULS FRUIT & VEG",    grn:"15428726", commodity:"NAAR", variety:"HM", count:"12", qty:5,   price:14,  date:"26/05/2026" },
   { buyer:"PAULS FRUIT & VEG",    grn:"15415663", commodity:"KIWI", variety:"*",  count:"20", qty:5,   price:160, date:"26/05/2026" },
   { buyer:"PAULS FRUIT & VEG",    grn:"15444988", commodity:"AVOS", variety:"AH", count:"*",  qty:5,   price:162, date:"26/05/2026" },
-  { buyer:"WOMEGO SEYUM NUNO",    grn:"15429348", commodity:"NAAR", variety:"LR", count:"1X", qty:30,  price:70,  date:"26/05/2026" },
   { buyer:"GEBREYSUS KERIGA TEK", grn:"15397488", commodity:"AVOS", variety:"AH", count:"14", qty:84,  price:70,  date:"26/05/2026" },
   { buyer:"FLM SA (PTY) LTD",     grn:"15442214", commodity:"KIWI", variety:"*",  count:"20", qty:75,  price:240, date:"26/05/2026" },
-  { buyer:"MUHACHA ABENITO JOAO", grn:"15444723", commodity:"STRS", variety:"*",  count:"16", qty:40,  price:640, date:"26/05/2026" },
   { buyer:"WELKOM MINI MARKET",   grn:"15415663", commodity:"KIWI", variety:"*",  count:"20", qty:37,  price:128, date:"26/05/2026" },
-  { buyer:"FERREIRA TYRONE",      grn:"15444973", commodity:"AVOS", variety:"MA", count:"22", qty:8,   price:80,  date:"26/05/2026" },
-  { buyer:"PIONEER FRESH",        grn:"15429339", commodity:"AVOS", variety:"AF", count:"14", qty:20,  price:100, date:"26/05/2026" },
   { buyer:"AFRICAN FRUIT CO",     grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:30,  price:100, date:"26/05/2026" },
-  { buyer:"ALI ENDRIS",           grn:"15442587", commodity:"AVOS", variety:"AH", count:"20", qty:166, price:60,  date:"26/05/2026" },
   { buyer:"MUSTAFA AGMAT",        grn:"15421261", commodity:"NAAR", variety:"LR", count:"1X", qty:104, price:60,  date:"26/05/2026" },
   { buyer:"RANDGATE SPAR",        grn:"15429339", commodity:"AVOS", variety:"AF", count:"14", qty:10,  price:110, date:"26/05/2026" },
-  { buyer:"ARGYROU SAVEWAYS",     grn:"15428726", commodity:"NAAR", variety:"HM", count:"12", qty:36,  price:10,  date:"26/05/2026" },
   { buyer:"KATOMPA MWAMBA",       grn:"15428721", commodity:"NAAR", variety:"HM", count:"15", qty:400, price:10,  date:"26/05/2026" },
-  { buyer:"GARDENFRESH",          grn:"15442235", commodity:"FIGS", variety:"*",  count:"20", qty:5,   price:200, date:"26/05/2026" },
-  { buyer:"SIBIYA SAM",           grn:"15387810", commodity:"AVOS", variety:"MA", count:"14", qty:26,  price:60,  date:"05/05/2026" },
-  { buyer:"MM FOODS",             grn:"15373522", commodity:"FIGS", variety:"*",  count:"30", qty:5,   price:240, date:"05/05/2026" },
-  { buyer:"PICK N PAY BRACKENH",  grn:"15401127", commodity:"KIWI", variety:"*",  count:"8",  qty:25,  price:160, date:"05/05/2026" },
-  { buyer:"RIVERSIDE FRESH",      grn:"15391663", commodity:"AVOS", variety:"AH", count:"16", qty:50,  price:80,  date:"05/05/2026" },
-  { buyer:"RIVERSIDE FRESH",      grn:"15340998", commodity:"AVOS", variety:"AH", count:"20", qty:20,  price:70,  date:"05/05/2026" },
-  { buyer:"TROPICAPE FRUIT PACK", grn:"15400623", commodity:"STRS", variety:"*",  count:"16", qty:20,  price:640, date:"05/05/2026" },
+  { buyer:"GO FRESH HOSPITALITY", grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:20,  price:100, date:"26/05/2026" },
+  { buyer:"RIVERSIDE FRESH",      grn:"15429339", commodity:"AVOS", variety:"AF", count:"14", qty:15,  price:100, date:"26/05/2026" },
   { buyer:"FLM SA (PTY) LTD",     grn:"15398683", commodity:"DRAG", variety:"*",  count:"10", qty:160, price:160, date:"05/05/2026" },
-  { buyer:"ZAMAN MD OHEDUZ",      grn:"15400098", commodity:"LEMS", variety:"*",  count:"56", qty:10,  price:140, date:"05/05/2026" },
-  { buyer:"SIESTA (PTY) LTD",     grn:"15391736", commodity:"FIGS", variety:"*",  count:"30", qty:2,   price:300, date:"05/05/2026" },
-  { buyer:"GO FRESH HOSPITALITY", grn:"15400623", commodity:"STRS", variety:"*",  count:"16", qty:8,   price:640, date:"05/05/2026" },
+  { buyer:"FLM SA (PTY) LTD",     grn:"15403543", commodity:"GVS",  variety:"*",  count:"L",  qty:200, price:50,  date:"05/05/2026" },
 ];
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-function parseJSON(envVar, name) {
-  try {
-    let raw = (process.env[envVar] || "").trim();
-    raw = raw.replace(/\\\\n/g, "\\n");
-    const obj = JSON.parse(raw);
-    if (obj.private_key) obj.private_key = obj.private_key.replace(/\n/g, "\n");
-    console.log(`✅ Parsed ${name}`);
-    return obj;
-  } catch(e) {
-    console.error(`❌ Could not parse ${name}: ${e.message}`);
-    throw e;
-  }
+// ── Helper functions ──────────────────────────────────────────────────────────
+function parseJSON(envVar, label) {
+  const raw = process.env[envVar];
+  if (!raw) throw new Error(`Missing env var: ${envVar} (${label})`);
+  try { return JSON.parse(raw); }
+  catch(e) { throw new Error(`Invalid JSON in ${envVar}: ${e.message}`); }
 }
 
+function todayStr() {
+  const d = new Date();
+  return String(d.getDate()).padStart(2,"0") + String(d.getMonth()+1).padStart(2,"0") + d.getFullYear();
+}
+
+// ── buildModel ────────────────────────────────────────────────────────────────
 function buildModel(history) {
   const m = {};
   for (const h of history) {
     const b = h.buyer;
     if (!b) continue;
-    // Sanitise all fields — Firebase rejects undefined values
     const commodity = h.commodity || 'UNK';
     const variety   = h.variety   || '*';
     const count     = h.count     || h.size || '*';
     const qty       = Number(h.qty)   || 0;
     const price     = Number(h.price) || 0;
     const date      = h.date || '';
-
     const k = [commodity, variety, count].filter(v => v && v !== "*").join("|");
     if (!m[b]) m[b] = {};
     if (!m[b][k]) m[b][k] = { totalQty:0, txCount:0, priceSum:0, lastDate:"", commodity, variety, count };
@@ -107,57 +121,14 @@ function buildModel(history) {
   return m;
 }
 
-// ── Slip PDF parser ───────────────────────────────────────────────────────────
-// Buyer slips are handled by Apps Script (processNewSlips) — not by Render.
-// This function is kept as a stub to avoid errors.
+// ── Slip PDF parser (stub — handled by Apps Script) ───────────────────────────
 function parseSlipPdf(pdfPath, filename) {
   return Promise.resolve([]);
 }
 
-function parseCommodityLine(line) {
-  line = (line || "").toUpperCase();
-  let commodity = "UNK", variety = "*", count = "*";
-  if      (line.includes("AVOCADO"))    commodity = "AVOS";
-  else if (line.includes("LEMON"))      commodity = "LEMS";
-  else if (line.includes("NAARTJ") || line.includes("HAARTJ")) commodity = "NAAR";
-  else if (line.includes("ORANGE"))     commodity = "ORGS";
-  else if (line.includes("CLEMENTINE")) commodity = "CLTM";
-  else if (line.includes("KIWI"))       commodity = "KIWI";
-  else if (line.includes("STRAWB"))     commodity = "STRS";
-  else if (line.includes("FIG"))        commodity = "FIGS";
-  else if (line.includes("GUAVA"))      commodity = "GVS";
-  else if (line.includes("DRAGON"))     commodity = "DRAG";
-  const varMatch = line.match(/\b(AF|AH|AK|MA|LR|HM|NV|M1|AE)\b/);
-  if (varMatch) variety = varMatch[1];
-  const cntMatch = line.match(/;(\d+|1X{1,3}|[LMSX]+);/);
-  if (cntMatch) count = cntMatch[1];
-  return { commodity, variety, count };
-}
+function parseSlip(text, filename) { return []; }
 
-function parseSlip(snippet, filename) {
-  if (!snippet) return [];
-  const rows = [];
-  const buyerMatch = snippet.match(/BUYER:\s*([^\n]+)/);
-  const dateMatch  = snippet.match(/DATE:\s*(\d{2}\/[A-Z]+\/\d{4})/);
-  const buyer  = buyerMatch ? buyerMatch[1].trim().replace(/\\/g,"").replace(/\[|\]/g,"") : "UNKNOWN";
-  const months = {JAN:"01",FEB:"02",MAR:"03",APR:"04",MAY:"05",JUN:"06",JUL:"07",AUG:"08",SEP:"09",OCT:"10",NOV:"11",DEC:"12"};
-  const dp     = dateMatch ? dateMatch[1].match(/(\d{2})\/([A-Z]+)\/(\d{4})/) : null;
-  const date   = dp ? `${dp[1]}/${months[dp[2]]||"05"}/${dp[3]}` : "26/05/2026";
-  const blocks = [...snippet.matchAll(/GRN:\s*(\d+)[\s\S]*?SALE\s+([\d,]+)\s*@\s*([\d.]+)/g)];
-  for (const m of blocks) {
-    const grn   = m[1];
-    const qty   = parseInt(m[2].replace(/,/g,"")) || 0;
-    const price = parseFloat(m[3]) || 0;
-    const grnPos = snippet.indexOf(`GRN: ${grn}`);
-    const around = snippet.substring(Math.max(0,grnPos-200), grnPos+200);
-    const commMatch = around.match(/\n([A-Z][A-Z ,;:\/*\d]+)\n/);
-    const { commodity, variety, count } = parseCommodityLine(commMatch ? commMatch[1] : "");
-    if (qty > 0) rows.push({ buyer, grn, commodity, variety, count, qty, price, date, src: filename });
-  }
-  return rows;
-}
-
-// ── Spatial stock PDF parser (pdfplumber) ─────────────────────────────────────
+// ── Spatial stock PDF parser ──────────────────────────────────────────────────
 function parsePdfSpatial(pdfPath, filename, today) {
   return new Promise((resolve) => {
     if (!fs.existsSync(PARSER_SCRIPT)) { console.warn("   ⚠️  parse_stock_pdf.py not found"); return resolve([]); }
@@ -229,6 +200,158 @@ async function downloadPdfToTemp(fileId, filename) {
   }
 }
 
+// ── WhatsApp via Twilio ───────────────────────────────────────────────────────
+function sendWhatsApp(to, message) {
+  return new Promise((resolve) => {
+    const body = new URLSearchParams({ From: TWILIO_FROM, To: `whatsapp:${to}`, Body: message }).toString();
+    const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`;
+    const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64");
+    const options = {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": `Basic ${auth}`, "Content-Length": Buffer.byteLength(body) },
+    };
+    const req = https.request(url, options, (res) => {
+      let data = "";
+      res.on("data", chunk => data += chunk);
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          console.log(`   📱 WhatsApp sent to ${to}`);
+          resolve(true);
+        } else {
+          console.warn(`   ⚠️  WhatsApp failed (${res.statusCode}): ${data.slice(0,200)}`);
+          resolve(false);
+        }
+      });
+    });
+    req.on("error", e => { console.warn(`   ⚠️  WhatsApp error: ${e.message}`); resolve(false); });
+    req.write(body);
+    req.end();
+  });
+}
+
+// ── Match score between a stock row and buyer history preference ──────────────
+function calcMatchScore(stockRow, buyerPref) {
+  // buyerPref: { commodity, variety, count/size, pack }
+  if (stockRow.commodity !== buyerPref.commodity) return 0;
+
+  let score = 40; // base for commodity match
+
+  // Variety match (+20)
+  if (buyerPref.variety && buyerPref.variety !== '*' && stockRow.variety !== '*') {
+    if (stockRow.variety === buyerPref.variety) score += 20;
+    else score -= 10;
+  } else {
+    score += 10; // open variety — partial credit
+  }
+
+  // Size match (+20)
+  const stockSize = stockRow.size || stockRow.count || '*';
+  const prefSize  = buyerPref.count || buyerPref.size || '*';
+  if (prefSize !== '*' && stockSize !== '*') {
+    if (stockSize === prefSize) score += 20;
+    else score += 5; // close but not exact
+  } else {
+    score += 10;
+  }
+
+  // Pack match (+20)
+  if (buyerPref.pack && buyerPref.pack !== '*' && stockRow.pack) {
+    if (stockRow.pack === buyerPref.pack) score += 20;
+    else score += 5;
+  } else {
+    score += 10;
+  }
+
+  return Math.min(score, 100);
+}
+
+// ── Notify buyers about matching new stock ────────────────────────────────────
+async function notifyBuyers(newStockRows, user) {
+  try {
+    // Load buyer phones from Firebase
+    const phonesSnap = await db.ref("buyerPhones").once("value");
+    const phonesRaw  = phonesSnap.val() || {};
+    // Build map: sanitised key → phone
+    const phoneMap = {};
+    for (const [key, val] of Object.entries(phonesRaw)) {
+      if (val.buyerName && val.phone) {
+        phoneMap[val.buyerName.toUpperCase()] = val.phone;
+      }
+    }
+
+    if (Object.keys(phoneMap).length === 0) {
+      console.log("   📵 No buyer phones in Firebase — skipping WhatsApp");
+      return;
+    }
+
+    // Load buyer model from Firebase
+    const modelSnap = await db.ref("jdw/model").once("value");
+    const model = modelSnap.val() || {};
+
+    // Track sent notifications today to avoid duplicates
+    const today = new Date().toISOString().slice(0,10);
+    const sentSnap = await db.ref(`jdw/whatsappSent/${today}`).once("value");
+    const sent = sentSnap.val() || {};
+
+    const salesman = SALESMAN_PHONES[user] || user;
+    let notifCount = 0;
+
+    for (const stockRow of newStockRows) {
+      if (!stockRow.flr || stockRow.flr < 1) continue; // skip empty stock
+
+      const commFull = COMM_NAMES[stockRow.commodity] || stockRow.commodity;
+      const packFull = PACK_NAMES[stockRow.pack] || stockRow.pack || '';
+      const varFull  = VARIETY_NAMES[stockRow.variety] || (stockRow.variety !== '*' ? stockRow.variety : '');
+      const sizeStr  = stockRow.size && stockRow.size !== '*' ? `sz ${stockRow.size}` : '';
+
+      for (const [buyerName, buyerPrefs] of Object.entries(model)) {
+        const phone = phoneMap[buyerName.toUpperCase()];
+        if (!phone) continue; // no phone for this buyer
+
+        for (const [prefKey, pref] of Object.entries(buyerPrefs)) {
+          if (pref.commodity !== stockRow.commodity) continue;
+
+          const score = calcMatchScore(stockRow, pref);
+          if (score < 80) continue;
+
+          // Dedup key — one notification per buyer per commodity per day
+          const dedupKey = `${buyerName}|${stockRow.commodity}|${stockRow.grn}`;
+          if (sent[dedupKey.replace(/[.#$[\]/]/g,'_')]) continue;
+
+          // Build message
+          const parts = [commFull, varFull, packFull, sizeStr].filter(Boolean).join(', ');
+          const message =
+            `🌿 *SubTrop RSA — Fresh Stock Alert*\n\n` +
+            `Hi! Fresh *${parts}* just arrived at JHB Fresh Produce Market.\n\n` +
+            `Floor stock: *${stockRow.flr} units*\n` +
+            `Contact: ${salesman}\n\n` +
+            `_This is an automated stock alert from SubTrop RSA_`;
+
+          console.log(`   📱 Notifying ${buyerName} (${phone}) — ${commFull} match ${score}%`);
+          const ok = await sendWhatsApp(phone, message);
+
+          if (ok) {
+            // Mark as sent
+            const safeKey = dedupKey.replace(/[.#$[\]/]/g,'_');
+            await db.ref(`jdw/whatsappSent/${today}/${safeKey}`).set({
+              buyer: buyerName, commodity: stockRow.commodity,
+              grn: stockRow.grn, score, ts: new Date().toISOString()
+            });
+            notifCount++;
+          }
+          break; // one notification per buyer per stock row
+        }
+      }
+    }
+
+    if (notifCount > 0) console.log(`   ✅ Sent ${notifCount} WhatsApp notifications`);
+    else console.log("   ℹ️  No new WhatsApp notifications to send");
+
+  } catch(e) {
+    console.error("   ❌ WhatsApp notify error:", e.message);
+  }
+}
+
 // ── Process a single stock file and push to Firebase ─────────────────────────
 async function processStockFile(fileId, filename) {
   const base = filename.toLowerCase().replace(".pdf","");
@@ -237,7 +360,6 @@ async function processStockFile(fileId, filename) {
   else if (base.includes("cdw"))   user = "CW";
   else if (base.includes("pot"))   user = "POT";
 
-  // Extract date from filename e.g. 03062026cdw.pdf → 03062026
   const dateMatch = filename.match(/^(\d{8})/);
   const today = dateMatch ? dateMatch[1] : todayStr();
 
@@ -278,19 +400,16 @@ async function processStockFile(fileId, filename) {
     };
   });
 
-  // PUT replaces the salesman's entire stock with this file's data
   await db.ref(`stock/${user}`).set(stockByGrn);
   console.log(`   ✅ Stock pushed: /stock/${user} — ${rows.length} rows from ${filename}`);
+
+  // Send WhatsApp notifications for matching buyers
+  await notifyBuyers(rows, user);
+
   return rows.length;
 }
 
-// ── STOCK SYNC (polling — processes any unprocessed files) ────────────────────
-function todayStr() {
-  const d = new Date();
-  return String(d.getDate()).padStart(2,"0") + String(d.getMonth()+1).padStart(2,"0") + d.getFullYear();
-}
-
-// Track processed file IDs in memory (resets on server restart — that's fine)
+// ── STOCK SYNC ────────────────────────────────────────────────────────────────
 const processedStockFiles = new Set();
 
 async function syncStock() {
@@ -300,10 +419,10 @@ async function syncStock() {
       q: `'${STOCK_SCANS_FOLDER}' in parents and mimeType = 'application/pdf'`,
       fields: "files(id,name,createdTime)",
       pageSize: 200,
-      orderBy: "createdTime asc",  // oldest first so newest wins
+      orderBy: "createdTime asc",
     });
-    const allFiles  = res.data.files || [];
-    const newFiles  = allFiles.filter(f => !processedStockFiles.has(f.id));
+    const allFiles = res.data.files || [];
+    const newFiles = allFiles.filter(f => !processedStockFiles.has(f.id));
 
     if (newFiles.length === 0) { console.log("   ✅ No new stock files"); return; }
     console.log(`   🔄 Processing ${newFiles.length} new stock file(s)...`);
@@ -318,73 +437,6 @@ async function syncStock() {
     }
   } catch(e) {
     console.error("   ❌ Stock sync error:", e.message);
-  }
-}
-
-// ── BUYER HISTORY SYNC ────────────────────────────────────────────────────────
-async function syncBuyerHistory() {
-  console.log("   🧾 Checking buyer history...");
-  try {
-    const processedSnap = await db.ref("jdw/processedFiles").once("value");
-    const processed = processedSnap.val() || {};
-
-    const res = await drive.files.list({
-      q: `'${BUYER_HISTORY_FOLDER}' in parents and mimeType = 'application/pdf'`,
-      fields: "files(id,name,createdTime)",
-      pageSize: 200,
-      orderBy: "createdTime desc",
-    });
-    const allFiles = res.data.files || [];
-    const newFiles = allFiles.filter(f => !processed[f.id]);
-    console.log(`   📂 Buyer History: ${allFiles.length} total, ${newFiles.length} new`);
-    if (newFiles.length === 0) { console.log("   ✅ No new slips"); return; }
-
-    const histSnap = await db.ref("jdw/history").once("value");
-    let history = histSnap.val() || [];
-    if (!Array.isArray(history)) history = Object.values(history);
-
-    let newRows = [];
-    for (const file of newFiles) {
-      let tmpPath = null;
-      try {
-        tmpPath = await downloadPdfToTemp(file.id, file.name);
-        let rows = [];
-        if (tmpPath) rows = await parseSlipPdf(tmpPath, file.name);
-        if (rows.length === 0) {
-          console.warn(`   ⚠️  OCR parser got 0 rows for ${file.name}, trying indexableText`);
-          const fileRes = await drive.files.get({ fileId: file.id, fields: "contentHints/indexableText" });
-          const snippet = fileRes.data?.contentHints?.indexableText || "";
-          rows = parseSlip(snippet, file.name);
-        }
-        newRows = newRows.concat(rows);
-        processed[file.id] = new Date().toISOString();
-        console.log(`   ✅ ${file.name} → ${rows.length} rows`);
-      } catch(e) {
-        console.warn(`   ⚠️  ${file.name}: ${e.message}`);
-        processed[file.id] = "error";
-      } finally {
-        if (tmpPath) { try { fs.unlinkSync(tmpPath); } catch {} }
-      }
-    }
-
-    const existing = new Set(history.map(h => `${h.buyer}|${h.grn}|${h.date}`));
-    const toAdd    = newRows.filter(r => !existing.has(`${r.buyer}|${r.grn}|${r.date}`));
-    const updated  = [...history, ...toAdd];
-    const model    = buildModel(updated);
-
-    await db.ref("jdw").update({
-      history: updated, model, processedFiles: processed,
-      lastSync: { ts: new Date().toISOString(), newRows: toAdd.length, total: updated.length, buyers: Object.keys(model).length },
-    });
-
-    const logSnap = await db.ref("jdw/log").once("value");
-    const log = Array.isArray(logSnap.val()) ? logSnap.val() : [];
-    log.push({ ts: new Date().toLocaleTimeString("en-ZA"), user:"AUTO-SYNC", msg:`📥 ${toAdd.length} new tx · ${updated.length} total · ${Object.keys(model).length} buyers` });
-    await db.ref("jdw/log").set(log.slice(-100));
-
-    console.log(`   ✅ Buyer history: ${toAdd.length} new rows | ${updated.length} total`);
-  } catch(e) {
-    console.error("   ❌ Buyer history sync error:", e.message);
   }
 }
 
@@ -404,47 +456,30 @@ async function sync() {
       console.log(`   ✅ Seeded ${SEED_HISTORY.length} transactions`);
     }
 
-    // Buyer history is handled by Apps Script (processNewSlips) — not here
+    // Buyer history handled by Apps Script
     await syncStock();
   } catch(err) {
     console.error("❌ Sync error:", err.message);
   }
 }
 
-// ── HTTP SERVER — keep-alive + /trigger-stock endpoint ────────────────────────
+// ── HTTP SERVER ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  // Health check
   if (req.method === "GET" && req.url === "/") {
-    return res.end("jdw-sync alive");
+    return res.end("jdw-sync v5 alive");
   }
 
-  // Trigger endpoint — called by Apps Script when new stock PDF detected
-  // POST /trigger-stock
-  // Body: { secret, fileId, filename }
   if (req.method === "POST" && req.url === "/trigger-stock") {
     let body = "";
     req.on("data", chunk => body += chunk);
     req.on("end", async () => {
       try {
         const { secret, fileId, filename } = JSON.parse(body);
-
-        if (secret !== TRIGGER_SECRET) {
-          res.writeHead(403);
-          return res.end(JSON.stringify({ error: "Unauthorized" }));
-        }
-
-        if (!fileId || !filename) {
-          res.writeHead(400);
-          return res.end(JSON.stringify({ error: "fileId and filename required" }));
-        }
-
+        if (secret !== TRIGGER_SECRET) { res.writeHead(403); return res.end(JSON.stringify({ error: "Unauthorized" })); }
+        if (!fileId || !filename) { res.writeHead(400); return res.end(JSON.stringify({ error: "fileId and filename required" })); }
         console.log(`\n📡 Trigger received: ${filename} (${fileId})`);
-
-        // Respond immediately so Apps Script doesn't time out
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "processing", filename }));
-
-        // Process in background
         try {
           initFirebase();
           initDrive();
@@ -454,7 +489,6 @@ const server = http.createServer(async (req, res) => {
         } catch(e) {
           console.error(`   ❌ Trigger processing error: ${e.message}`);
         }
-
       } catch(e) {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
@@ -468,6 +502,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000);
-console.log(`🚀 jdw-sync v4 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
+console.log(`🚀 jdw-sync v5 starting — polling every ${POLL_MINUTES} min + /trigger-stock + WhatsApp notifications`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
