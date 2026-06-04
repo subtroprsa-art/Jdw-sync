@@ -28,9 +28,9 @@ const TWILIO_FROM  = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886"
 
 // Salesman contact numbers for the message
 const SALESMAN_PHONES = {
-  RJ:  "Riaan 082-xxx-xxxx",
-  CW:  "Christoff 082-xxx-xxxx",
-  POT: "George 082-xxx-xxxx",
+  RJ:  "Riaan 084-516-4717",
+  CW:  "Christoff 082-418-6030",
+  POT: "George 082-418-6030",
 };
 
 // Commodity full names
