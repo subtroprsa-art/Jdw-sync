@@ -28,9 +28,9 @@ const TWILIO_FROM  = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886"
 
 // Salesman contact numbers for the message
 const SALESMAN_PHONES = {
-  RJ:  "Riaan 084-516-4717",
-  CW:  "Christoff 082-418-6030",
-  POT: "George 082-418-6030",
+  RJ:  "Riaan 082-xxx-xxxx",
+  CW:  "Christoff 082-xxx-xxxx",
+  POT: "George 082-xxx-xxxx",
 };
 
 // Commodity full names
@@ -283,6 +283,12 @@ async function notifyBuyers(newStockRows, user) {
       console.log("   📵 No buyer phones in Firebase — skipping WhatsApp");
       return;
     }
+
+    // ⚠️  TEST MODE — redirect all notifications to one number
+    // Remove this block when going live
+    const TEST_NUMBER = "+27673972793";
+    for (const key of Object.keys(phoneMap)) phoneMap[key] = TEST_NUMBER;
+    console.log("   🧪 TEST MODE — all notifications redirected to " + TEST_NUMBER);
 
     // Load buyer model from Firebase
     const modelSnap = await db.ref("jdw/model").once("value");
