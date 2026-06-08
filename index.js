@@ -1,14 +1,12 @@
 /**
  * jdw-sync v5
  * - Stock Scans: watches folder every 5 min + instant /trigger-stock endpoint
- * - WhatsApp notifications via Twilio when stock matches buyer preferences 80%+
  */
 
 const { google }   = require("googleapis");
 const admin        = require("firebase-admin");
 const cron         = require("node-cron");
 const http         = require("http");
-const https        = require("https");
 const { execFile } = require("child_process");
 const fs           = require("fs");
 const os           = require("os");
@@ -21,34 +19,12 @@ const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
 const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
 const TRIGGER_SECRET       = process.env.TRIGGER_SECRET || "jdw-trigger-2026";
 
-// Twilio credentials — loaded from Render environment variables only
-const TWILIO_SID   = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_FROM  = process.env.TWILIO_WHATSAPP_FROM || "whatsapp:+14155238886";
-
-// Salesman contact numbers for the message
-const SALESMAN_PHONES = {
-  RJ:  "Riaan 082-xxx-xxxx",
-  CW:  "Christoff 082-xxx-xxxx",
-  POT: "George 082-xxx-xxxx",
-};
-
 // Commodity full names
 const COMM_NAMES = {
   AVOS:"Avocados", LEMS:"Lemons", FIGS:"Figs", KIWI:"Kiwifruit",
   ORGS:"Oranges", GVS:"Guavas", CLTM:"Clementines", NAAR:"Naartjies",
   STRS:"Strawberries", MANG:"Mangoes", DRAG:"Dragon Fruit", GFT:"Grapefruit",
   SATS:"Satsumas", PAPO:"Papino",
-};
-
-const VARIETY_NAMES = {
-  AF:"Fuerte", AH:"Hass", AK:"Pinkerton", MA:"Maluma", MD:"Dusa", NV:"Navel",
-};
-
-const PACK_NAMES = {
-  TR040:"4KG Tray", BG150:"15KG Bag", BG160:"16KG Bag",
-  CTT150:"15KG Carton", PTB005:"500G Punnet", PTB002:"160G Punnet",
-  DL076:"DL 076 Carton", PC030:"3KG Pocket", PC060:"6KG Pocket",
 };
 
 // ── Seed history ─────────────────────────────────────────────────────────────
@@ -200,164 +176,6 @@ async function downloadPdfToTemp(fileId, filename) {
   }
 }
 
-// ── WhatsApp via Twilio ───────────────────────────────────────────────────────
-function sendWhatsApp(to, message) {
-  return new Promise((resolve) => {
-    const body = new URLSearchParams({ From: TWILIO_FROM, To: `whatsapp:${to}`, Body: message }).toString();
-    const url  = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_SID}/Messages.json`;
-    const auth = Buffer.from(`${TWILIO_SID}:${TWILIO_TOKEN}`).toString("base64");
-    const options = {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": `Basic ${auth}`, "Content-Length": Buffer.byteLength(body) },
-    };
-    const req = https.request(url, options, (res) => {
-      let data = "";
-      res.on("data", chunk => data += chunk);
-      res.on("end", () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          console.log(`   📱 WhatsApp sent to ${to}`);
-          resolve(true);
-        } else {
-          console.warn(`   ⚠️  WhatsApp failed (${res.statusCode}): ${data.slice(0,200)}`);
-          resolve(false);
-        }
-      });
-    });
-    req.on("error", e => { console.warn(`   ⚠️  WhatsApp error: ${e.message}`); resolve(false); });
-    req.write(body);
-    req.end();
-  });
-}
-
-// ── Match score between a stock row and buyer history preference ──────────────
-function calcMatchScore(stockRow, buyerPref) {
-  // buyerPref: { commodity, variety, count/size, pack }
-  if (stockRow.commodity !== buyerPref.commodity) return 0;
-
-  let score = 40; // base for commodity match
-
-  // Variety match (+20)
-  if (buyerPref.variety && buyerPref.variety !== '*' && stockRow.variety !== '*') {
-    if (stockRow.variety === buyerPref.variety) score += 20;
-    else score -= 10;
-  } else {
-    score += 10; // open variety — partial credit
-  }
-
-  // Size match (+20)
-  const stockSize = stockRow.size || stockRow.count || '*';
-  const prefSize  = buyerPref.count || buyerPref.size || '*';
-  if (prefSize !== '*' && stockSize !== '*') {
-    if (stockSize === prefSize) score += 20;
-    else score += 5; // close but not exact
-  } else {
-    score += 10;
-  }
-
-  // Pack match (+20)
-  if (buyerPref.pack && buyerPref.pack !== '*' && stockRow.pack) {
-    if (stockRow.pack === buyerPref.pack) score += 20;
-    else score += 5;
-  } else {
-    score += 10;
-  }
-
-  return Math.min(score, 100);
-}
-
-// ── Notify buyers about matching new stock ────────────────────────────────────
-async function notifyBuyers(newStockRows, user) {
-  try {
-    // Load buyer phones from Firebase
-    const phonesSnap = await db.ref("buyerPhones").once("value");
-    const phonesRaw  = phonesSnap.val() || {};
-    // Build map: sanitised key → phone
-    const phoneMap = {};
-    for (const [key, val] of Object.entries(phonesRaw)) {
-      if (val.buyerName && val.phone) {
-        phoneMap[val.buyerName.toUpperCase()] = val.phone;
-      }
-    }
-
-    if (Object.keys(phoneMap).length === 0) {
-      console.log("   📵 No buyer phones in Firebase — skipping WhatsApp");
-      return;
-    }
-
-    // ⚠️  TEST MODE — redirect all notifications to one number
-    // Remove this block when going live
-    const TEST_NUMBER = "+27845164717";
-    for (const key of Object.keys(phoneMap)) phoneMap[key] = TEST_NUMBER;
-    console.log("   🧪 TEST MODE — all notifications redirected to " + TEST_NUMBER);
-
-    // Load buyer model from Firebase
-    const modelSnap = await db.ref("jdw/model").once("value");
-    const model = modelSnap.val() || {};
-
-    // Track sent notifications today to avoid duplicates
-    const today = new Date().toISOString().slice(0,10);
-    const sentSnap = await db.ref(`jdw/whatsappSent/${today}`).once("value");
-    const sent = sentSnap.val() || {};
-
-    const salesman = SALESMAN_PHONES[user] || user;
-    let notifCount = 0;
-
-    for (const stockRow of newStockRows) {
-      if (!stockRow.flr || stockRow.flr < 1) continue; // skip empty stock
-
-      const commFull = COMM_NAMES[stockRow.commodity] || stockRow.commodity;
-      const packFull = PACK_NAMES[stockRow.pack] || stockRow.pack || '';
-      const varFull  = VARIETY_NAMES[stockRow.variety] || (stockRow.variety !== '*' ? stockRow.variety : '');
-      const sizeStr  = stockRow.size && stockRow.size !== '*' ? `sz ${stockRow.size}` : '';
-
-      for (const [buyerName, buyerPrefs] of Object.entries(model)) {
-        const phone = phoneMap[buyerName.toUpperCase()];
-        if (!phone) continue; // no phone for this buyer
-
-        for (const [prefKey, pref] of Object.entries(buyerPrefs)) {
-          if (pref.commodity !== stockRow.commodity) continue;
-
-          const score = calcMatchScore(stockRow, pref);
-          if (score < 80) continue;
-
-          // Dedup key — one notification per buyer per commodity per day
-          const dedupKey = `${buyerName}|${stockRow.commodity}|${stockRow.grn}`;
-          if (sent[dedupKey.replace(/[.#$[\]/]/g,'_')]) continue;
-
-          // Build message
-          const parts = [commFull, varFull, packFull, sizeStr].filter(Boolean).join(', ');
-          const message =
-            `🌿 *SubTrop RSA — Fresh Stock Alert*\n\n` +
-            `Hi! Fresh *${parts}* just arrived at JHB Fresh Produce Market.\n\n` +
-            `Floor stock: *${stockRow.flr} units*\n` +
-            `Contact: ${salesman}\n\n` +
-            `_This is an automated stock alert from SubTrop RSA_`;
-
-          console.log(`   📱 Notifying ${buyerName} (${phone}) — ${commFull} match ${score}%`);
-          const ok = await sendWhatsApp(phone, message);
-
-          if (ok) {
-            // Mark as sent
-            const safeKey = dedupKey.replace(/[.#$[\]/]/g,'_');
-            await db.ref(`jdw/whatsappSent/${today}/${safeKey}`).set({
-              buyer: buyerName, commodity: stockRow.commodity,
-              grn: stockRow.grn, score, ts: new Date().toISOString()
-            });
-            notifCount++;
-          }
-          break; // one notification per buyer per stock row
-        }
-      }
-    }
-
-    if (notifCount > 0) console.log(`   ✅ Sent ${notifCount} WhatsApp notifications`);
-    else console.log("   ℹ️  No new WhatsApp notifications to send");
-
-  } catch(e) {
-    console.error("   ❌ WhatsApp notify error:", e.message);
-  }
-}
-
 // ── Process a single stock file and push to Firebase ─────────────────────────
 async function processStockFile(fileId, filename) {
   const base = filename.toLowerCase().replace(".pdf","");
@@ -408,9 +226,6 @@ async function processStockFile(fileId, filename) {
 
   await db.ref(`stock/${user}`).set(stockByGrn);
   console.log(`   ✅ Stock pushed: /stock/${user} — ${rows.length} rows from ${filename}`);
-
-  // Send WhatsApp notifications for matching buyers
-  await notifyBuyers(rows, user);
 
   return rows.length;
 }
@@ -508,6 +323,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000);
-console.log(`🚀 jdw-sync v5 starting — polling every ${POLL_MINUTES} min + /trigger-stock + WhatsApp notifications`);
+console.log(`🚀 jdw-sync v5 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
