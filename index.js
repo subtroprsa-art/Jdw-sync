@@ -342,7 +342,7 @@ const server = http.createServer(async (req, res) => {
           generationConfig: { maxOutputTokens: 2000, temperature: 0.3 }
         });
 
-        const geminiPath = "/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=" + GEMINI_KEY;
+        const geminiPath = "/v1beta/models/gemini-2.5-flash:generateContent";
 
         const options = {
           hostname: "generativelanguage.googleapis.com",
@@ -350,6 +350,7 @@ const server = http.createServer(async (req, res) => {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_KEY,
             "Content-Length": Buffer.byteLength(payload)
           }
         };
