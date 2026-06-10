@@ -6,8 +6,8 @@
 
 const { google }   = require("googleapis");
 const admin        = require("firebase-admin");
-const cron         = require("node-cron");
 const http         = require("http");
+const cron         = require("node-cron");
 const https        = require("https");
 
 const { execFile } = require("child_process");
@@ -18,7 +18,6 @@ const path         = require("path");
 const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
 const STOCK_SCANS_FOLDER   = process.env.DRIVE_STOCK_SCANS_FOLDER_ID   || "1DrYmim6xThu6KfKRplr5SDBVZc-BFMBm";
 const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
-const POLL_MINUTES         = parseInt(process.env.POLL_MINUTES || "5");
 const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
 const TRIGGER_SECRET       = process.env.TRIGGER_SECRET || "jdw-trigger-2026";
 
@@ -302,7 +301,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── Health check ───────────────────────────────────────────────────────────
   if (req.method === "GET" && req.url === "/") {
-    return res.end("jdw-sync v8 alive");
+    return res.end("jdw-sync v9 alive");
   }
 
   // ── Trigger stock sync ─────────────────────────────────────────────────────
@@ -494,6 +493,11 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000);
-console.log(`🚀 jdw-sync v8 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
+console.log("🚀 jdw-sync v9 starting — polling 04:00-12:00 every 30 min + instant /trigger-stock");
 sync();
-cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
+// Poll every 30 min between 04:00 and 12:00 (Johannesburg time = UTC+2)
+// Cron runs in UTC: 04:00 SAST = 02:00 UTC, 12:00 SAST = 10:00 UTC
+cron.schedule("0,30 2-10 * * *", () => {
+  console.log(`[${new Date().toISOString()}] ⏰ Scheduled poll`);
+  sync();
+});
