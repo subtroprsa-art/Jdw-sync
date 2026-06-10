@@ -7,6 +7,9 @@ const { google }   = require("googleapis");
 const admin        = require("firebase-admin");
 const cron         = require("node-cron");
 const http         = require("http");
+const https        = require("https");
+
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const { execFile } = require("child_process");
 const fs           = require("fs");
 const os           = require("os");
@@ -316,6 +319,65 @@ const server = http.createServer(async (req, res) => {
       }
     });
     return;
+  }
+
+  // AI Match endpoint
+  if (req.method === "POST" && req.url === "/ai-match") {
+    // CORS headers so GitHub Pages can call Render
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", async () => {
+      try {
+        const { prompt } = JSON.parse(body);
+        if (!prompt) { res.writeHead(400); return res.end(JSON.stringify({ error: "prompt required" })); }
+        if (!ANTHROPIC_KEY) { res.writeHead(500); return res.end(JSON.stringify({ error: "ANTHROPIC_API_KEY not set on server" })); }
+
+        const payload = JSON.stringify({
+          model: "claude-haiku-4-5-20251001",
+          max_tokens: 1500,
+          messages: [{ role: "user", content: prompt }]
+        });
+
+        const options = {
+          hostname: "api.anthropic.com",
+          path: "/v1/messages",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_KEY,
+            "anthropic-version": "2023-06-01",
+            "Content-Length": Buffer.byteLength(payload)
+          }
+        };
+
+        const apiReq = https.request(options, (apiRes) => {
+          let data = "";
+          apiRes.on("data", chunk => data += chunk);
+          apiRes.on("end", () => {
+            res.writeHead(apiRes.statusCode, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+            res.end(data);
+          });
+        });
+        apiReq.on("error", (e) => {
+          res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+          res.end(JSON.stringify({ error: e.message }));
+        });
+        apiReq.write(payload);
+        apiReq.end();
+      } catch(e) {
+        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
+      }
+    });
+    return;
+  }
+
+  // CORS preflight
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "POST, GET, OPTIONS" });
+    return res.end();
   }
 
   res.writeHead(404);
