@@ -443,7 +443,14 @@ const server = http.createServer(async (req, res) => {
               // ✅ Success
               console.log(`   ✅ Gemini success with ${model} (attempt ${attempt})`);
               res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              return res.end(JSON.stringify({ content: [{ type: "text", text }], model }));
+              // Sanitize text before sending — remove control chars and ensure clean JSON
+              const cleanText = text
+                .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '')  // control chars
+                .replace(/\u2014/g, '-')   // em dash
+                .replace(/\u2013/g, '-')   // en dash  
+                .replace(/\u2018|\u2019/g, "'")  // smart single quotes
+                .replace(/\u201c|\u201d/g, '"');  // smart double quotes
+              return res.end(JSON.stringify({ content: [{ type: "text", text: cleanText }], model }));
 
             } catch(e) {
               lastError = e.message;
