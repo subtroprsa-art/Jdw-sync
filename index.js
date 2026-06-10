@@ -1,6 +1,7 @@
 /**
- * jdw-sync v5
+ * jdw-sync v6
  * - Stock Scans: watches folder every 5 min + instant /trigger-stock endpoint
+ * - AI Match: Gemini 2.5 Flash via /ai-match endpoint
  */
 
 const { google }   = require("googleapis");
@@ -9,7 +10,6 @@ const cron         = require("node-cron");
 const http         = require("http");
 const https        = require("https");
 
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY; // kept for reference
 const { execFile } = require("child_process");
 const fs           = require("fs");
 const os           = require("os");
@@ -289,18 +289,37 @@ async function sync() {
 
 // ── HTTP SERVER ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
-  if (req.method === "GET" && req.url === "/") {
-    return res.end("jdw-sync v5 alive");
+
+  // ── CORS preflight (must be first) ─────────────────────────────────────────
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, {
+      "Access-Control-Allow-Origin":  "*",
+      "Access-Control-Allow-Headers": "Content-Type",
+      "Access-Control-Allow-Methods": "POST, GET, OPTIONS"
+    });
+    return res.end();
   }
 
+  // ── Health check ───────────────────────────────────────────────────────────
+  if (req.method === "GET" && req.url === "/") {
+    return res.end("jdw-sync v6 alive");
+  }
+
+  // ── Trigger stock sync ─────────────────────────────────────────────────────
   if (req.method === "POST" && req.url === "/trigger-stock") {
     let body = "";
     req.on("data", chunk => body += chunk);
     req.on("end", async () => {
       try {
         const { secret, fileId, filename } = JSON.parse(body);
-        if (secret !== TRIGGER_SECRET) { res.writeHead(403); return res.end(JSON.stringify({ error: "Unauthorized" })); }
-        if (!fileId || !filename) { res.writeHead(400); return res.end(JSON.stringify({ error: "fileId and filename required" })); }
+        if (secret !== TRIGGER_SECRET) {
+          res.writeHead(403);
+          return res.end(JSON.stringify({ error: "Unauthorized" }));
+        }
+        if (!fileId || !filename) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ error: "fileId and filename required" }));
+        }
         console.log(`\n📡 Trigger received: ${filename} (${fileId})`);
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ status: "processing", filename }));
@@ -321,35 +340,39 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // AI Match endpoint
+  // ── AI Match endpoint ──────────────────────────────────────────────────────
   if (req.method === "POST" && req.url === "/ai-match") {
-    // CORS headers so GitHub Pages can call Render
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
     let body = "";
     req.on("data", chunk => body += chunk);
     req.on("end", async () => {
       try {
         const { prompt } = JSON.parse(body);
-        if (!prompt) { res.writeHead(400); return res.end(JSON.stringify({ error: "prompt required" })); }
-        if (!ANTHROPIC_KEY) { res.writeHead(500); return res.end(JSON.stringify({ error: "ANTHROPIC_API_KEY not set on server" })); }
+
+        if (!prompt) {
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "prompt required" }));
+        }
 
         const GEMINI_KEY = process.env.GEMINI_API_KEY;
-        if (!GEMINI_KEY) { res.writeHead(500); return res.end(JSON.stringify({ error: "GEMINI_API_KEY not set on server" })); }
+        if (!GEMINI_KEY) {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "GEMINI_API_KEY not set on server" }));
+        }
 
         const payload = JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: 2000, temperature: 0.3 }
         });
 
-        const geminiPath = "/v1beta/models/gemini-2.5-flash:generateContent";
-
         const options = {
           hostname: "generativelanguage.googleapis.com",
-          path: geminiPath,
-          method: "POST",
+          path:     "/v1beta/models/gemini-2.5-flash:generateContent",
+          method:   "POST",
           headers: {
-            "Content-Type": "application/json",
+            "Content-Type":   "application/json",
             "x-goog-api-key": GEMINI_KEY,
             "Content-Length": Buffer.byteLength(payload)
           }
@@ -361,23 +384,53 @@ const server = http.createServer(async (req, res) => {
           apiRes.on("end", () => {
             try {
               const geminiResp = JSON.parse(data);
-              // Convert Gemini response format to Anthropic-like format for the PWA
+
+              // Surface Gemini API errors clearly
+              if (geminiResp.error) {
+                console.error("   ❌ Gemini error:", JSON.stringify(geminiResp.error));
+                res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                return res.end(JSON.stringify({
+                  error:   "Gemini: " + geminiResp.error.message,
+                  code:    geminiResp.error.code,
+                  status:  geminiResp.error.status
+                }));
+              }
+
               const text = geminiResp.candidates?.[0]?.content?.parts?.[0]?.text || "";
-              const converted = JSON.stringify({ content: [{ type: "text", text }] });
+
+              // Surface empty/blocked responses
+              if (!text) {
+                const reason = geminiResp.candidates?.[0]?.finishReason || "unknown";
+                console.warn("   ⚠️  Gemini empty response, finishReason:", reason);
+                res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+                return res.end(JSON.stringify({
+                  error:      "Empty Gemini response",
+                  finishReason: reason,
+                  raw:        geminiResp
+                }));
+              }
+
+              // Convert to Anthropic-like format the PWA expects
               res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              res.end(converted);
+              res.end(JSON.stringify({ content: [{ type: "text", text }] }));
+
             } catch(e) {
+              console.error("   ❌ Gemini parse error:", e.message, "| raw:", data.slice(0, 300));
               res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              res.end(JSON.stringify({ error: "Gemini parse error: " + e.message }));
+              res.end(JSON.stringify({ error: "Gemini parse error: " + e.message, raw: data.slice(0, 500) }));
             }
           });
         });
+
         apiReq.on("error", (e) => {
+          console.error("   ❌ Gemini request error:", e.message);
           res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ error: e.message }));
+          res.end(JSON.stringify({ error: "Network error calling Gemini: " + e.message }));
         });
+
         apiReq.write(payload);
         apiReq.end();
+
       } catch(e) {
         res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
@@ -386,17 +439,12 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // CORS preflight
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "POST, GET, OPTIONS" });
-    return res.end();
-  }
-
+  // ── 404 ────────────────────────────────────────────────────────────────────
   res.writeHead(404);
   res.end("Not found");
 });
 
 server.listen(process.env.PORT || 3000);
-console.log(`🚀 jdw-sync v5 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
+console.log(`🚀 jdw-sync v6 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
