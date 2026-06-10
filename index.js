@@ -365,8 +365,8 @@ const server = http.createServer(async (req, res) => {
         // Model cascade: try 2.5-flash first, fall back to 1.5-flash if unavailable
         const MODELS = [
           "gemini-2.5-flash",
-          "gemini-1.5-flash-latest",
-          "gemini-1.5-flash-002",
+          "gemini-1.5-flash",
+          "gemini-2.0-flash",
         ];
         const MAX_RETRIES = 3;
         const RETRY_DELAY_MS = 2000;
@@ -440,14 +440,11 @@ const server = http.createServer(async (req, res) => {
                 break; // try next model
               }
 
-              // ✅ Success
+              // ✅ Success — parse JSON server-side to eliminate bad chars before sending
               console.log(`   ✅ Gemini success with ${model} (attempt ${attempt})`);
-              res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              // Parse Gemini JSON on the server where we have full control
-              // This avoids any character encoding issues reaching the browser
-              let parsedResult;
+              let finalText;
+              let preparse = false;
               try {
-                // Strip markdown fences and find outermost { }
                 let s = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
                 let start = s.indexOf('{');
                 if (start === -1) throw new Error('No JSON object');
@@ -457,26 +454,18 @@ const server = http.createServer(async (req, res) => {
                   else if (s[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
                 }
                 let jsonStr = end !== -1 ? s.slice(start, end + 1) : s.slice(start);
-                // Remove control characters
                 jsonStr = jsonStr.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-                // Fix trailing commas
                 jsonStr = jsonStr.replace(/,\s*([\]\}])/g, '$1');
-                parsedResult = JSON.parse(jsonStr);
+                const parsed = JSON.parse(jsonStr);
+                finalText = JSON.stringify(parsed);
+                preparse = true;
+                console.log("   ✅ Server-side JSON parse OK");
               } catch(parseErr) {
-                console.error("   Server-side JSON parse failed:", parseErr.message);
-                // Return raw text and let client handle it
-                parsedResult = null;
+                console.error("   ⚠️  Server-side JSON parse failed:", parseErr.message, "— sending raw");
+                finalText = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
               }
-              if (parsedResult) {
-                // Re-encode as clean JSON — this guarantees no bad chars reach the browser
-                res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                return res.end(JSON.stringify({ content: [{ type: "text", text: JSON.stringify(parsedResult) }], model, preparse: true }));
-              } else {
-                // Fallback: send raw text with basic sanitization
-                const cleanText = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-                res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                return res.end(JSON.stringify({ content: [{ type: "text", text: cleanText }], model }));
-              }
+              res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+              return res.end(JSON.stringify({ content: [{ type: "text", text: finalText }], model, preparse }));
 
             } catch(e) {
               lastError = e.message;
