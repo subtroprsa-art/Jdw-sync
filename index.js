@@ -9,7 +9,7 @@ const cron         = require("node-cron");
 const http         = require("http");
 const https        = require("https");
 
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY; // kept for reference
 const { execFile } = require("child_process");
 const fs           = require("fs");
 const os           = require("os");
@@ -334,20 +334,22 @@ const server = http.createServer(async (req, res) => {
         if (!prompt) { res.writeHead(400); return res.end(JSON.stringify({ error: "prompt required" })); }
         if (!ANTHROPIC_KEY) { res.writeHead(500); return res.end(JSON.stringify({ error: "ANTHROPIC_API_KEY not set on server" })); }
 
+        const GEMINI_KEY = process.env.GEMINI_API_KEY;
+        if (!GEMINI_KEY) { res.writeHead(500); return res.end(JSON.stringify({ error: "GEMINI_API_KEY not set on server" })); }
+
         const payload = JSON.stringify({
-          model: "claude-haiku-4-5-20251001",
-          max_tokens: 2000,
-          messages: [{ role: "user", content: prompt }]
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { maxOutputTokens: 2000, temperature: 0.3 }
         });
 
+        const geminiPath = "/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=" + GEMINI_KEY;
+
         const options = {
-          hostname: "api.anthropic.com",
-          path: "/v1/messages",
+          hostname: "generativelanguage.googleapis.com",
+          path: geminiPath,
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            "x-api-key": ANTHROPIC_KEY,
-            "anthropic-version": "2023-06-01",
             "Content-Length": Buffer.byteLength(payload)
           }
         };
@@ -356,8 +358,17 @@ const server = http.createServer(async (req, res) => {
           let data = "";
           apiRes.on("data", chunk => data += chunk);
           apiRes.on("end", () => {
-            res.writeHead(apiRes.statusCode, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-            res.end(data);
+            try {
+              const geminiResp = JSON.parse(data);
+              // Convert Gemini response format to Anthropic-like format for the PWA
+              const text = geminiResp.candidates?.[0]?.content?.parts?.[0]?.text || "";
+              const converted = JSON.stringify({ content: [{ type: "text", text }] });
+              res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+              res.end(converted);
+            } catch(e) {
+              res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+              res.end(JSON.stringify({ error: "Gemini parse error: " + e.message }));
+            }
           });
         });
         apiReq.on("error", (e) => {
