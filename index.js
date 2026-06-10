@@ -302,7 +302,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── Health check ───────────────────────────────────────────────────────────
   if (req.method === "GET" && req.url === "/") {
-    return res.end("jdw-sync v6 alive");
+    return res.end("jdw-sync v7 alive");
   }
 
   // ── Trigger stock sync ─────────────────────────────────────────────────────
@@ -362,74 +362,100 @@ const server = http.createServer(async (req, res) => {
           return res.end(JSON.stringify({ error: "GEMINI_API_KEY not set on server" }));
         }
 
+        // Model cascade: try 2.5-flash first, fall back to 1.5-flash if unavailable
+        const MODELS = [
+          "gemini-2.5-flash",
+          "gemini-1.5-flash",
+        ];
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY_MS = 2000;
+
+        // Promisified single Gemini call
+        function callGemini(model, payload) {
+          return new Promise((resolve, reject) => {
+            const options = {
+              hostname: "generativelanguage.googleapis.com",
+              path:     `/v1beta/models/${model}:generateContent`,
+              method:   "POST",
+              headers: {
+                "Content-Type":   "application/json",
+                "x-goog-api-key": GEMINI_KEY,
+                "Content-Length": Buffer.byteLength(payload)
+              }
+            };
+            const apiReq = https.request(options, (apiRes) => {
+              let data = "";
+              apiRes.on("data", chunk => data += chunk);
+              apiRes.on("end", () => {
+                try {
+                  resolve({ parsed: JSON.parse(data), raw: data });
+                } catch(e) {
+                  reject(new Error("JSON parse error: " + e.message + " | raw: " + data.slice(0, 300)));
+                }
+              });
+            });
+            apiReq.on("error", (e) => reject(new Error("Network error: " + e.message)));
+            apiReq.write(payload);
+            apiReq.end();
+          });
+        }
+
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
         const payload = JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: 2000, temperature: 0.3 }
         });
 
-        const options = {
-          hostname: "generativelanguage.googleapis.com",
-          path:     "/v1beta/models/gemini-2.5-flash:generateContent",
-          method:   "POST",
-          headers: {
-            "Content-Type":   "application/json",
-            "x-goog-api-key": GEMINI_KEY,
-            "Content-Length": Buffer.byteLength(payload)
-          }
-        };
+        let lastError = null;
 
-        const apiReq = https.request(options, (apiRes) => {
-          let data = "";
-          apiRes.on("data", chunk => data += chunk);
-          apiRes.on("end", () => {
+        for (const model of MODELS) {
+          for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-              const geminiResp = JSON.parse(data);
+              console.log(`   🤖 Gemini attempt ${attempt}/${MAX_RETRIES} with ${model}`);
+              const { parsed: geminiResp } = await callGemini(model, payload);
 
-              // Surface Gemini API errors clearly
+              // 503 / UNAVAILABLE — retryable
+              if (geminiResp.error?.code === 503 || geminiResp.error?.status === "UNAVAILABLE") {
+                lastError = `${model} unavailable (503)`;
+                console.warn(`   ⚠️  ${lastError} — attempt ${attempt}/${MAX_RETRIES}`);
+                if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
+                continue; // retry same model
+              }
+
+              // Any other Gemini error — not retryable, try next model
               if (geminiResp.error) {
-                console.error("   ❌ Gemini error:", JSON.stringify(geminiResp.error));
-                res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                return res.end(JSON.stringify({
-                  error:   "Gemini: " + geminiResp.error.message,
-                  code:    geminiResp.error.code,
-                  status:  geminiResp.error.status
-                }));
+                lastError = `${model}: ${geminiResp.error.message} (${geminiResp.error.status})`;
+                console.error(`   ❌ Gemini error on ${model}:`, JSON.stringify(geminiResp.error));
+                break; // skip remaining retries, try next model
               }
 
               const text = geminiResp.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
-              // Surface empty/blocked responses
               if (!text) {
                 const reason = geminiResp.candidates?.[0]?.finishReason || "unknown";
-                console.warn("   ⚠️  Gemini empty response, finishReason:", reason);
-                res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-                return res.end(JSON.stringify({
-                  error:      "Empty Gemini response",
-                  finishReason: reason,
-                  raw:        geminiResp
-                }));
+                lastError = `${model} empty response, finishReason: ${reason}`;
+                console.warn(`   ⚠️  ${lastError}`);
+                break; // try next model
               }
 
-              // Convert to Anthropic-like format the PWA expects
+              // ✅ Success
+              console.log(`   ✅ Gemini success with ${model} (attempt ${attempt})`);
               res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              res.end(JSON.stringify({ content: [{ type: "text", text }] }));
+              return res.end(JSON.stringify({ content: [{ type: "text", text }], model }));
 
             } catch(e) {
-              console.error("   ❌ Gemini parse error:", e.message, "| raw:", data.slice(0, 300));
-              res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              res.end(JSON.stringify({ error: "Gemini parse error: " + e.message, raw: data.slice(0, 500) }));
+              lastError = e.message;
+              console.error(`   ❌ ${model} attempt ${attempt} threw: ${e.message}`);
+              if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
             }
-          });
-        });
+          }
+        }
 
-        apiReq.on("error", (e) => {
-          console.error("   ❌ Gemini request error:", e.message);
-          res.writeHead(500, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-          res.end(JSON.stringify({ error: "Network error calling Gemini: " + e.message }));
-        });
-
-        apiReq.write(payload);
-        apiReq.end();
+        // All models and retries exhausted
+        console.error("   ❌ All Gemini models exhausted. Last error:", lastError);
+        res.writeHead(503, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+        res.end(JSON.stringify({ error: "AI unavailable — all models exhausted. Last error: " + lastError }));
 
       } catch(e) {
         res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
@@ -445,6 +471,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000);
-console.log(`🚀 jdw-sync v6 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
+console.log(`🚀 jdw-sync v7 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
