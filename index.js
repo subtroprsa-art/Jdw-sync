@@ -302,7 +302,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── Health check ───────────────────────────────────────────────────────────
   if (req.method === "GET" && req.url === "/") {
-    return res.end("jdw-sync v7 alive");
+    return res.end("jdw-sync v8 alive");
   }
 
   // ── Trigger stock sync ─────────────────────────────────────────────────────
@@ -365,7 +365,8 @@ const server = http.createServer(async (req, res) => {
         // Model cascade: try 2.5-flash first, fall back to 1.5-flash if unavailable
         const MODELS = [
           "gemini-2.5-flash",
-          "gemini-1.5-flash",
+          "gemini-1.5-flash-latest",
+          "gemini-1.5-flash-002",
         ];
         const MAX_RETRIES = 3;
         const RETRY_DELAY_MS = 2000;
@@ -471,6 +472,6 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000);
-console.log(`🚀 jdw-sync v7 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
+console.log(`🚀 jdw-sync v8 starting — polling every ${POLL_MINUTES} min + /trigger-stock endpoint`);
 sync();
 cron.schedule(`*/${POLL_MINUTES} * * * *`, sync);
