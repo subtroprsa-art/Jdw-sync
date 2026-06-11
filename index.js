@@ -404,7 +404,8 @@ const server = http.createServer(async (req, res) => {
 
         const payload = JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 3000, temperature: 0.1 }
+          generationConfig: { maxOutputTokens: 3000, temperature: 0.1, responseMimeType: "application/json" },
+          systemInstruction: { parts: [{ text: "You are a JSON API. Respond with valid JSON only. No markdown, no explanation, no text before or after the JSON object." }] }
         });
 
         let lastError = null;
