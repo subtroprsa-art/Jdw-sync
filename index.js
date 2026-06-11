@@ -404,7 +404,7 @@ const server = http.createServer(async (req, res) => {
 
         const payload = JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 4000, temperature: 0.2 }
+          generationConfig: { maxOutputTokens: 1500, temperature: 0.1 }
         });
 
         let lastError = null;
