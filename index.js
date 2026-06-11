@@ -439,32 +439,37 @@ const server = http.createServer(async (req, res) => {
                 break; // try next model
               }
 
-              // ✅ Success — parse JSON server-side to eliminate bad chars before sending
+              // ✅ Gemini responded — validate JSON server-side
+              // If JSON is invalid (truncated), treat as a retryable error
               console.log(`   ✅ Gemini success with ${model} (attempt ${attempt})`);
-              let finalText;
-              let preparse = false;
+              let parsed;
               try {
                 let s = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
                 let start = s.indexOf('{');
-                if (start === -1) throw new Error('No JSON object');
+                if (start === -1) throw new Error('No JSON object in response');
                 let depth = 0, end = -1;
                 for (let i = start; i < s.length; i++) {
                   if (s[i] === '{') depth++;
                   else if (s[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
                 }
-                let jsonStr = end !== -1 ? s.slice(start, end + 1) : s.slice(start);
+                if (end === -1) throw new Error('Truncated JSON — no closing brace');
+                let jsonStr = s.slice(start, end + 1);
                 jsonStr = jsonStr.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
                 jsonStr = jsonStr.replace(/,\s*([\]\}])/g, '$1');
-                const parsed = JSON.parse(jsonStr);
-                finalText = JSON.stringify(parsed);
-                preparse = true;
-                console.log("   ✅ Server-side JSON parse OK");
+                parsed = JSON.parse(jsonStr);
+                // Validate it has the expected structure
+                if (!parsed.matches || !Array.isArray(parsed.matches)) throw new Error('Missing matches array');
+                console.log(`   ✅ Server JSON parse OK — ${parsed.matches.length} matches`);
               } catch(parseErr) {
-                console.error("   ⚠️  Server-side JSON parse failed:", parseErr.message, "— sending raw");
-                finalText = text.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
+                // Treat bad JSON as a retryable error — retry same model or next
+                lastError = `JSON invalid: ${parseErr.message}`;
+                console.error(`   ❌ ${model} attempt ${attempt} JSON error: ${parseErr.message}`);
+                if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
+                continue;
               }
+              // Send clean re-encoded JSON — no bad chars can reach the browser
               res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              return res.end(JSON.stringify({ content: [{ type: "text", text: finalText }], model, preparse }));
+              return res.end(JSON.stringify({ content: [{ type: "text", text: JSON.stringify(parsed) }], model, preparse: true }));
 
             } catch(e) {
               lastError = e.message;
