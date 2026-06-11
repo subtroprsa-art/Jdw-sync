@@ -364,8 +364,8 @@ const server = http.createServer(async (req, res) => {
         // Model cascade: try 2.5-flash first, fall back to 1.5-flash if unavailable
         const MODELS = [
           "gemini-2.5-flash",
-          "gemini-2.5-flash-lite-preview-06-17",
-          "gemini-2.0-flash",
+          "gemini-2.5-flash-lite",
+          "gemini-3.5-flash",
         ];
         const MAX_RETRIES = 3;
         const RETRY_DELAY_MS = 2000;
@@ -404,7 +404,7 @@ const server = http.createServer(async (req, res) => {
 
         const payload = JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 3000, temperature: 0.1, responseMimeType: "application/json" },
+          generationConfig: { maxOutputTokens: 3000, temperature: 0.1, response_mime_type: "application/json" },
           systemInstruction: { parts: [{ text: "You are a JSON API. Respond with valid JSON only. No markdown, no explanation, no text before or after the JSON object." }] }
         });
 
@@ -445,28 +445,18 @@ const server = http.createServer(async (req, res) => {
               console.log(`   ✅ Gemini success with ${model} (attempt ${attempt})`);
               let parsed;
               try {
-                let s = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').trim();
-                let start = s.indexOf('{');
-                if (start === -1) throw new Error('No JSON object in response');
-                let depth = 0, end = -1;
-                for (let i = start; i < s.length; i++) {
-                  if (s[i] === '{') depth++;
-                  else if (s[i] === '}') { depth--; if (depth === 0) { end = i; break; } }
-                }
-                if (end === -1) throw new Error('Truncated JSON — no closing brace');
-                let jsonStr = s.slice(start, end + 1);
-                jsonStr = jsonStr.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '');
-                jsonStr = jsonStr.replace(/,\s*([\]\}])/g, '$1');
+                let s = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g,'').trim();
+                let start = s.indexOf('{'), end = s.lastIndexOf('}');
+                if (start === -1 || end <= start) throw new Error('No JSON object found');
+                let jsonStr = s.slice(start, end + 1).replace(/,\s*([\]\}])/g, '$1');
                 parsed = JSON.parse(jsonStr);
-                // Validate it has the expected structure
                 if (!parsed.matches || !Array.isArray(parsed.matches)) throw new Error('Missing matches array');
                 console.log(`   ✅ Server JSON parse OK — ${parsed.matches.length} matches`);
               } catch(parseErr) {
-                // Treat bad JSON as a retryable error — retry same model or next
                 lastError = `JSON invalid: ${parseErr.message}`;
                 console.error(`   ❌ ${model} attempt ${attempt} JSON error: ${parseErr.message}`);
-                if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
-                continue;
+                if (attempt < MAX_RETRIES) { await sleep(RETRY_DELAY_MS); continue; }
+                break; // exhausted retries for this model, try next
               }
               // Send clean re-encoded JSON — no bad chars can reach the browser
               res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
