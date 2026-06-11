@@ -301,7 +301,7 @@ const server = http.createServer(async (req, res) => {
 
   // ── Health check ───────────────────────────────────────────────────────────
   if (req.method === "GET" && req.url === "/") {
-    return res.end("jdw-sync v9 alive");
+    return res.end("jdw-sync v10 alive");
   }
 
   // ── Trigger stock sync ─────────────────────────────────────────────────────
@@ -364,8 +364,8 @@ const server = http.createServer(async (req, res) => {
         // Model cascade: try 2.5-flash first, fall back to 1.5-flash if unavailable
         const MODELS = [
           "gemini-2.5-flash",
-          "gemini-1.5-flash",
-          "gemini-2.0-flash",
+          "gemini-2.0-flash-lite",
+          "gemini-1.5-flash-8b",
         ];
         const MAX_RETRIES = 3;
         const RETRY_DELAY_MS = 2000;
@@ -498,8 +498,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(process.env.PORT || 3000);
-console.log("🚀 jdw-sync v9 starting — polling 04:00-12:00 every 30 min + instant /trigger-stock");
-sync();
+console.log("🚀 jdw-sync v10 starting — polling 04:00-12:00 every 30 min + instant /trigger-stock");
+// Delay startup sync by 10s to allow service to fully start
+setTimeout(sync, 10000);
 // Poll every 30 min between 04:00 and 12:00 (Johannesburg time = UTC+2)
 // Cron runs in UTC: 04:00 SAST = 02:00 UTC, 12:00 SAST = 10:00 UTC
 cron.schedule("0,30 2-10 * * *", () => {
