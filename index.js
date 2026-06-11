@@ -364,8 +364,8 @@ const server = http.createServer(async (req, res) => {
         // Model cascade: try 2.5-flash first, fall back to 1.5-flash if unavailable
         const MODELS = [
           "gemini-2.5-flash",
-          "gemini-2.0-flash-lite",
-          "gemini-1.5-flash-8b",
+          "gemini-2.5-flash-lite-preview-06-17",
+          "gemini-2.0-flash",
         ];
         const MAX_RETRIES = 3;
         const RETRY_DELAY_MS = 2000;
@@ -404,7 +404,7 @@ const server = http.createServer(async (req, res) => {
 
         const payload = JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 1500, temperature: 0.1 }
+          generationConfig: { maxOutputTokens: 3000, temperature: 0.1 }
         });
 
         let lastError = null;
