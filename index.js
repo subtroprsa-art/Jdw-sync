@@ -17,8 +17,10 @@ const path         = require("path");
 
 const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
 const STOCK_SCANS_FOLDER   = process.env.DRIVE_STOCK_SCANS_FOLDER_ID   || "1DrYmim6xThu6KfKRplr5SDBVZc-BFMBm";
+const FLOOR_BALANCE_FOLDER = process.env.DRIVE_FLOOR_BALANCE_FOLDER_ID || "";
 const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
 const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
+const FLOOR_PARSER_SCRIPT  = path.join(__dirname, "parse_floor_pdf.py");
 const TRIGGER_SECRET       = process.env.TRIGGER_SECRET || "jdw-trigger-2026";
 
 // Commodity full names
@@ -178,6 +180,48 @@ async function downloadPdfToTemp(fileId, filename) {
   }
 }
 
+// ── Process a single floor balance file and push to Firebase ──────────────────
+async function processFloorFile(fileId, filename) {
+  const base = filename.toLowerCase().replace(".pdf","");
+  let user = "unknown";
+  if      (base.includes("riaan") || base.includes("rj")) user = "RJ";
+  else if (base.includes("cdw")   || base.includes("christoff")) user = "CW";
+  else if (base.includes("pot"))  user = "POT";
+
+  const dateMatch = filename.match(/(\d{8})/);
+  const today = dateMatch ? dateMatch[1] : todayStr();
+
+  const tmpPath = await downloadPdfToTemp(fileId, filename);
+  if (!tmpPath) throw new Error("Download failed");
+
+  let rows = [];
+  try {
+    rows = await new Promise((resolve) => {
+      if (!fs.existsSync(FLOOR_PARSER_SCRIPT)) { console.warn("   ⚠️  parse_floor_pdf.py not found"); return resolve([]); }
+      execFile("python3", [FLOOR_PARSER_SCRIPT, tmpPath, user, today],
+        { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (stderr) console.warn(`   ⚠️  floor parser stderr: ${stderr.trim().slice(0,200)}`);
+          if (err) { console.error(`   ❌ Floor parser error: ${err.message}`); return resolve([]); }
+          try { resolve(JSON.parse(stdout)); } catch(e) { console.error(`   ❌ Floor JSON parse: ${e.message}`); resolve([]); }
+        }
+      );
+    });
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
+
+  if (rows.length === 0) { console.log(`   ⚠️  No rows from floor file ${filename}`); return 0; }
+
+  // Key by GRN+SEQ to avoid duplicates
+  const floorByKey = {};
+  rows.forEach(r => { floorByKey[r.grn + '_' + r.seq] = r; });
+
+  await db.ref(`floor/${user}`).set(floorByKey);
+  console.log(`   ✅ Floor pushed: /floor/${user} — ${rows.length} rows from ${filename}`);
+  return rows.length;
+}
+
 // ── Process a single stock file and push to Firebase ─────────────────────────
 async function processStockFile(fileId, filename) {
   const base = filename.toLowerCase().replace(".pdf","");
@@ -330,6 +374,34 @@ const server = http.createServer(async (req, res) => {
           console.log(`   ✅ Trigger complete: ${filename} → ${count} rows`);
         } catch(e) {
           console.error(`   ❌ Trigger processing error: ${e.message}`);
+        }
+      } catch(e) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
+      }
+    });
+    return;
+  }
+
+  // ── Trigger floor balance sync ────────────────────────────────────────────
+  if (req.method === "POST" && req.url === "/trigger-floor") {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", async () => {
+      try {
+        const { secret, fileId, filename } = JSON.parse(body);
+        if (secret !== TRIGGER_SECRET) { res.writeHead(403); return res.end(JSON.stringify({ error: "Unauthorized" })); }
+        if (!fileId || !filename) { res.writeHead(400); return res.end(JSON.stringify({ error: "fileId and filename required" })); }
+        console.log(`\n📡 Floor trigger received: ${filename} (${fileId})`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "processing", filename }));
+        try {
+          initFirebase();
+          initDrive();
+          const count = await processFloorFile(fileId, filename);
+          console.log(`   ✅ Floor trigger complete: ${filename} → ${count} rows`);
+        } catch(e) {
+          console.error(`   ❌ Floor trigger error: ${e.message}`);
         }
       } catch(e) {
         res.writeHead(400);
