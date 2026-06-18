@@ -570,7 +570,6 @@ const server = http.createServer(async (req, res) => {
 
         // Get image from Drive as base64
         initDrive();
-        const drive = google.drive({ version: "v3", auth: driveAuth });
         const fileMeta = await drive.files.get({ fileId, fields: "mimeType,name" });
         const imageRes = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
         const base64Image = Buffer.from(imageRes.data).toString("base64");
