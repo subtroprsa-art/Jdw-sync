@@ -555,6 +555,97 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+
+  // ── PROCESS COLDSTORE SLIP ────────────────────────────────────────────────
+  if (req.method === "POST" && req.url === "/process-coldstore") {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", async () => {
+      try {
+        const { secret, fileId, filename } = JSON.parse(body);
+        if (secret !== TRIGGER_SECRET) { res.writeHead(403); return res.end(JSON.stringify({ error: "Unauthorized" })); }
+        if (!fileId) { res.writeHead(400); return res.end(JSON.stringify({ error: "fileId required" })); }
+
+        console.log(`\n❄️  Coldstore slip received: ${filename}`);
+
+        // Get image from Drive as base64
+        initDrive();
+        const drive = google.drive({ version: "v3", auth: driveAuth });
+        const fileMeta = await drive.files.get({ fileId, fields: "mimeType,name" });
+        const imageRes = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
+        const base64Image = Buffer.from(imageRes.data).toString("base64");
+        const mimeType = fileMeta.data.mimeType;
+
+        // Send to Gemini Vision
+        const geminiKey = process.env.GEMINI_API_KEY;
+        const prompt = `Extract the following fields from this coldstore deposit slip image and return ONLY valid JSON:
+{
+  "depositNo": "deposit number",
+  "grn": "GRN number",
+  "date": "date as shown",
+  "commodity": "commodity code e.g. AVOS/LEMS/ORGS etc",
+  "pack": "container/pack type",
+  "variety": "variety",
+  "grade": "class e.g. CL 1 or CL 2",
+  "size": "size or * if asterisk",
+  "count": "count number or empty",
+  "producer": "producer name",
+  "salesman": "salesman name",
+  "qty": "quantity transferred as number",
+  "pallets": "number of pallets",
+  "fromLocation": "from location",
+  "toLocation": "to location - this determines ripening room vs coldroom"
+}
+Map commodity names to codes: Avocados=AVOS, Lemons=LEMS, Oranges=ORGS, Naartjies=NAAR, Clementines=CLTM, Grapefruit=GFT, Strawberries=BERS, Kiwifruit=KIWI.
+Return ONLY the JSON object, no other text.`;
+
+        const geminiRes = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{
+                parts: [
+                  { text: prompt },
+                  { inline_data: { mime_type: mimeType, data: base64Image } }
+                ]
+              }]
+            })
+          }
+        );
+
+        const geminiData = await geminiRes.json();
+        const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        if (!jsonMatch) throw new Error("No JSON in Gemini response");
+        const parsed = JSON.parse(jsonMatch[0]);
+
+        // Add metadata
+        parsed.depositedAt = new Date().toISOString();
+        parsed.status = "active";
+        parsed.filename = filename;
+        parsed.fileId = fileId;
+
+        // Save to Firebase
+        initFirebase();
+        const fb = require("firebase-admin");
+        const db = fb.database();
+        const key = parsed.depositNo || Date.now().toString();
+        await db.ref("coldstore/" + key).set(parsed);
+
+        console.log(`   ✅ Coldstore saved: ${parsed.commodity} - ${parsed.producer} - ${parsed.qty} units → ${parsed.toLocation}`);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, data: parsed }));
+      } catch(e) {
+        console.error("❌ Coldstore error:", e.message);
+        res.writeHead(500);
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    });
+    return;
+  }
+
   // ── 404 ────────────────────────────────────────────────────────────────────
   res.writeHead(404);
   res.end("Not found");
