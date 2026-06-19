@@ -659,26 +659,38 @@ Return ONLY the JSON object, no other text.`;
         }
         else if (slipType === 3) {
           // Withdrawal requested - update status to "withdrawal_pending"
+          // Only update if the original deposit record actually exists (defensive check)
           const key = parsed.originalDepositNo;
           if (key) {
-            await db.ref("coldstore/" + key).update({
-              status: "withdrawal_pending",
-              withdrawalNo: parsed.withdrawalNo,
-              withdrawalRequestedAt: parsed.processedAt
-            });
+            const existing = await db.ref("coldstore/" + key).once("value");
+            if (existing.exists()) {
+              await db.ref("coldstore/" + key).update({
+                status: "withdrawal_pending",
+                withdrawalNo: parsed.withdrawalNo,
+                withdrawalRequestedAt: parsed.processedAt
+              });
+              console.log(`   ✅ Slip 3 (Withdrawal Request): Deposit ${key} → withdrawal_pending`);
+            } else {
+              console.warn(`   ⚠️  Slip 3 (Withdrawal Request): No matching deposit ${key} found in coldstore — ignoring withdrawal, original deposit slip may be missing.`);
+            }
           }
-          console.log(`   ✅ Slip 3 (Withdrawal Request): Deposit ${key} → withdrawal_pending`);
         }
         else if (slipType === 4) {
           // Floor deposit confirmed - mark as "removed" (back on floor)
+          // Only update if the original deposit record actually exists (defensive check)
           const key = parsed.originalDepositNo;
           if (key) {
-            await db.ref("coldstore/" + key).update({
-              status: "removed",
-              removedAt: parsed.processedAt
-            });
+            const existing = await db.ref("coldstore/" + key).once("value");
+            if (existing.exists()) {
+              await db.ref("coldstore/" + key).update({
+                status: "removed",
+                removedAt: parsed.processedAt
+              });
+              console.log(`   ✅ Slip 4 (Floor Confirmed): Deposit ${key} → removed (back on floor)`);
+            } else {
+              console.warn(`   ⚠️  Slip 4 (Floor Confirmed): No matching deposit ${key} found in coldstore — ignoring, original deposit slip may be missing.`);
+            }
           }
-          console.log(`   ✅ Slip 4 (Floor Confirmed): Deposit ${key} → removed (back on floor)`);
         }
 
         res.writeHead(200, { "Content-Type": "application/json" });
