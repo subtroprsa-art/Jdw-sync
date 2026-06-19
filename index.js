@@ -599,7 +599,7 @@ Map commodity names to codes: Avocados=AVOS, Lemons=LEMS, Oranges=ORGS, Naartjie
 Return ONLY the JSON object, no other text.`;
 
         const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${geminiKey}`,
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
           {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -616,8 +616,9 @@ Return ONLY the JSON object, no other text.`;
 
         const geminiData = await geminiRes.json();
         const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        console.log("   Gemini raw response:", text.slice(0, 500));
         const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("No JSON in Gemini response");
+        if (!jsonMatch) throw new Error("No JSON in Gemini response. Raw text: " + text.slice(0, 200));
         const parsed = JSON.parse(jsonMatch[0]);
 
         // Add metadata
