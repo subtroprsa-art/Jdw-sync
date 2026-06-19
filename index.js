@@ -556,8 +556,9 @@ const server = http.createServer(async (req, res) => {
   }
 
 
-  // ── PROCESS COLDSTORE SLIP ────────────────────────────────────────────────
-  if (req.method === "POST" && req.url === "/process-coldstore") {
+
+  // ── PROCESS COLDSTORE SLIP (auto-detects type) ────────────────────────────
+  if (req.method === "POST" && req.url === "/process-coldstore-slip") {
     let body = "";
     req.on("data", chunk => body += chunk);
     req.on("end", async () => {
@@ -568,21 +569,28 @@ const server = http.createServer(async (req, res) => {
 
         console.log(`\n❄️  Coldstore slip received: ${filename}`);
 
-        // Get image from Drive as base64
         initDrive();
         const fileMeta = await drive.files.get({ fileId, fields: "mimeType,name" });
         const imageRes = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
         const base64Image = Buffer.from(imageRes.data).toString("base64");
         const mimeType = fileMeta.data.mimeType;
 
-        // Send to Gemini Vision
         const geminiKey = process.env.GEMINI_API_KEY;
-        const prompt = `Extract the following fields from this coldstore deposit slip image and return ONLY valid JSON:
+        const prompt = `This is a Johannesburg Fresh Produce Market slip. There are 4 possible slip types:
+1. "STOCK TRANSFER TO IN-TRANSIT FOR DEPOSIT INTO COLDSTORE" - deposit initiated
+2. "STOCK DEPOSIT INTO COLD STORE" - deposit confirmed (has QTY SENT and QTY DEPOSITED)
+3. "WITHDRAWAL REQUEST FROM COLD STORE" - withdrawal initiated (has WITHDRAWAL NO and ORIGINAL DEPOSIT NO)
+4. "STOCK DEPOSIT ONTO AGENT FLOOR" - withdrawal confirmed, back on floor (has WITHDRAWAL NO, ORIGINAL DEPOSIT NO, QTY DEPOSITED)
+
+First identify which slip type this is (1, 2, 3, or 4), then extract fields. Return ONLY valid JSON:
 {
-  "depositNo": "deposit number",
+  "slipType": 1, 2, 3, or 4,
+  "depositNo": "deposit number if present",
+  "withdrawalNo": "withdrawal number if present (slip type 3 or 4 only)",
+  "originalDepositNo": "original deposit number if present (slip type 3 or 4 only)",
   "grn": "GRN number",
   "date": "date as shown",
-  "commodity": "commodity code e.g. AVOS/LEMS/ORGS etc",
+  "commodity": "commodity code: Avocados=AVOS, Lemons=LEMS, Oranges=ORGS, Naartjies=NAAR, Clementines=CLTM, Grapefruit=GFT, Strawberries=BERS, Kiwifruit=KIWI",
   "pack": "container/pack type",
   "variety": "variety",
   "grade": "class e.g. CL 1 or CL 2",
@@ -590,12 +598,11 @@ const server = http.createServer(async (req, res) => {
   "count": "count number or empty",
   "producer": "producer name",
   "salesman": "salesman name",
-  "qty": "quantity transferred as number",
+  "qty": "the relevant quantity - QTY SENT/TRANSFERRED for slip 1, QTY DEPOSITED for slip 2, QTY REQUESTED for slip 3, QTY DEPOSITED for slip 4",
   "pallets": "number of pallets",
   "fromLocation": "from location",
-  "toLocation": "to location - this determines ripening room vs coldroom"
+  "toLocation": "to location"
 }
-Map commodity names to codes: Avocados=AVOS, Lemons=LEMS, Oranges=ORGS, Naartjies=NAAR, Clementines=CLTM, Grapefruit=GFT, Strawberries=BERS, Kiwifruit=KIWI.
 Return ONLY the JSON object, no other text.`;
 
         const geminiRes = await fetch(
@@ -621,118 +628,63 @@ Return ONLY the JSON object, no other text.`;
         if (!jsonMatch) throw new Error("No JSON in Gemini response. Raw text: " + text.slice(0, 200));
         const parsed = JSON.parse(jsonMatch[0]);
 
-        // Add metadata
-        parsed.depositedAt = new Date().toISOString();
-        parsed.status = "active";
+        const slipType = parseInt(parsed.slipType);
         parsed.filename = filename;
         parsed.fileId = fileId;
+        parsed.processedAt = new Date().toISOString();
 
-        // Save to Firebase
         initFirebase();
         const fb = require("firebase-admin");
         const db = fb.database();
-        const key = parsed.depositNo || Date.now().toString();
-        await db.ref("coldstore/" + key).set(parsed);
 
-        console.log(`   ✅ Coldstore saved: ${parsed.commodity} - ${parsed.producer} - ${parsed.qty} units → ${parsed.toLocation}`);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, data: parsed }));
-      } catch(e) {
-        console.error("❌ Coldstore error:", e.message);
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-    return;
-  }
-
-
-  // ── PROCESS COLDSTORE REMOVAL/WITHDRAWAL SLIP ────────────────────────────────
-  if (req.method === "POST" && req.url === "/process-coldstore-removal") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        const { secret, fileId, filename } = JSON.parse(body);
-        if (secret !== TRIGGER_SECRET) { res.writeHead(403); return res.end(JSON.stringify({ error: "Unauthorized" })); }
-        if (!fileId) { res.writeHead(400); return res.end(JSON.stringify({ error: "fileId required" })); }
-
-        console.log(`\n📤 Coldstore withdrawal slip received: ${filename}`);
-
-        initDrive();
-        const fileMeta = await drive.files.get({ fileId, fields: "mimeType,name" });
-        const imageRes = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
-        const base64Image = Buffer.from(imageRes.data).toString("base64");
-        const mimeType = fileMeta.data.mimeType;
-
-        const geminiKey = process.env.GEMINI_API_KEY;
-        const prompt = `Extract the following fields from this cold store WITHDRAWAL/REMOVAL slip image and return ONLY valid JSON:
-{
-  "withdrawalNo": "withdrawal number",
-  "depositNo": "original deposit number",
-  "grn": "GRN number",
-  "date": "date as shown",
-  "commodity": "commodity code e.g. AVOS/LEMS/ORGS etc",
-  "pack": "container/pack type",
-  "variety": "variety",
-  "grade": "class e.g. CL 1 or CL 2",
-  "size": "size or * if asterisk",
-  "count": "count number or empty",
-  "producer": "producer name",
-  "salesman": "salesman name",
-  "qty": "quantity requested as number",
-  "pallets": "number of pallets",
-  "fromLocation": "from location (the cold store / ripening room being withdrawn from)",
-  "toLocation": "to location (where it is going, usually back to floor)"
-}
-Map commodity names to codes: Avocados=AVOS, Lemons=LEMS, Oranges=ORGS, Naartjies=NAAR, Clementines=CLTM, Grapefruit=GFT, Strawberries=BERS, Kiwifruit=KIWI.
-Return ONLY the JSON object, no other text.`;
-
-        const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{
-                parts: [
-                  { text: prompt },
-                  { inline_data: { mime_type: mimeType, data: base64Image } }
-                ]
-              }]
-            })
-          }
-        );
-
-        const geminiData = await geminiRes.json();
-        const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        console.log("   Gemini raw response:", text.slice(0, 500));
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("No JSON in Gemini response. Raw text: " + text.slice(0, 200));
-        const parsed = JSON.parse(jsonMatch[0]);
-
-        parsed.removedAt = new Date().toISOString();
-        parsed.filename = filename;
-        parsed.fileId = fileId;
-
-        // Mark the original coldstore entry as removed in Firebase
-        initFirebase();
-        const fb = require("firebase-admin");
-        const db = fb.database();
-        const key = parsed.depositNo;
-        if (key) {
-          await db.ref("coldstore/" + key).update({
-            status: "removed",
-            removedAt: parsed.removedAt,
-            withdrawalNo: parsed.withdrawalNo
+        if (slipType === 1) {
+          // Transfer initiated - create record with status "in_transit"
+          const key = parsed.depositNo || Date.now().toString();
+          await db.ref("coldstore/" + key).set({
+            ...parsed,
+            status: "in_transit",
+            transferSlipAt: parsed.processedAt
           });
+          console.log(`   ✅ Slip 1 (Transfer): Deposit ${parsed.depositNo} → in_transit`);
+        }
+        else if (slipType === 2) {
+          // Deposit confirmed - update status to "active" (officially in coldstore)
+          const key = parsed.depositNo || Date.now().toString();
+          await db.ref("coldstore/" + key).update({
+            ...parsed,
+            status: "active",
+            depositedAt: parsed.processedAt
+          });
+          console.log(`   ✅ Slip 2 (Deposit Confirmed): Deposit ${parsed.depositNo} → active`);
+        }
+        else if (slipType === 3) {
+          // Withdrawal requested - update status to "withdrawal_pending"
+          const key = parsed.originalDepositNo;
+          if (key) {
+            await db.ref("coldstore/" + key).update({
+              status: "withdrawal_pending",
+              withdrawalNo: parsed.withdrawalNo,
+              withdrawalRequestedAt: parsed.processedAt
+            });
+          }
+          console.log(`   ✅ Slip 3 (Withdrawal Request): Deposit ${key} → withdrawal_pending`);
+        }
+        else if (slipType === 4) {
+          // Floor deposit confirmed - mark as "removed" (back on floor)
+          const key = parsed.originalDepositNo;
+          if (key) {
+            await db.ref("coldstore/" + key).update({
+              status: "removed",
+              removedAt: parsed.processedAt
+            });
+          }
+          console.log(`   ✅ Slip 4 (Floor Confirmed): Deposit ${key} → removed (back on floor)`);
         }
 
-        console.log(`   ✅ Coldstore removal processed: ${parsed.commodity} - ${parsed.producer} - ${parsed.qty} units, deposit ${parsed.depositNo} marked removed`);
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, data: parsed }));
+        res.end(JSON.stringify({ success: true, slipType, data: parsed }));
       } catch(e) {
-        console.error("❌ Coldstore removal error:", e.message);
+        console.error("❌ Coldstore slip error:", e.message);
         res.writeHead(500);
         res.end(JSON.stringify({ success: false, error: e.message }));
       }
