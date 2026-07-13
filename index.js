@@ -410,7 +410,11 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
-
+  // ── Floor trigger health check (GET) ──────────────────────────────────────
+  if (req.method === "GET" && req.url === "/trigger-floor") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ status: "Floor sync endpoint ready", secret_required: true }));
+  }
   // ── AI Match endpoint ──────────────────────────────────────────────────────
   if (req.method === "POST" && req.url === "/ai-match") {
     res.setHeader("Access-Control-Allow-Origin", "*");
