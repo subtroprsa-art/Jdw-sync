@@ -3,3 +3,4 @@ flask-cors
 easyocr
 Pillow
 numpy
+opencv-python-headless
