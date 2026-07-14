@@ -1,7 +1,5 @@
 /**
- * jdw-sync v6
- * - Stock Scans: watches folder every 5 min + instant /trigger-stock endpoint
- * - AI Match: Gemini 2.5 Flash via /ai-match endpoint
+ * jdw-sync v11 - with Tesseract OCR
  */
 
 const { google }   = require("googleapis");
@@ -9,7 +7,7 @@ const admin        = require("firebase-admin");
 const http         = require("http");
 const cron         = require("node-cron");
 const https        = require("https");
-
+const Tesseract    = require("tesseract.js");
 const { execFile } = require("child_process");
 const fs           = require("fs");
 const os           = require("os");
@@ -17,7 +15,6 @@ const path         = require("path");
 
 const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
 const STOCK_SCANS_FOLDER   = process.env.DRIVE_STOCK_SCANS_FOLDER_ID   || "1DrYmim6xThu6KfKRplr5SDBVZc-BFMBm";
-const FLOOR_BALANCE_FOLDER = process.env.DRIVE_FLOOR_BALANCE_FOLDER_ID || "";
 const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
 const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
 const FLOOR_PARSER_SCRIPT  = path.join(__dirname, "parse_floor_pdf.py");
@@ -101,51 +98,6 @@ function buildModel(history) {
   return m;
 }
 
-// ── Slip PDF parser (stub — handled by Apps Script) ───────────────────────────
-function parseSlipPdf(pdfPath, filename) {
-  return Promise.resolve([]);
-}
-
-function parseSlip(text, filename) { return []; }
-
-// ── Spatial stock PDF parser ──────────────────────────────────────────────────
-function parsePdfSpatial(pdfPath, filename, today) {
-  return new Promise((resolve) => {
-    if (!fs.existsSync(PARSER_SCRIPT)) { console.warn("   ⚠️  parse_stock_pdf.py not found"); return resolve([]); }
-    execFile("python3", [PARSER_SCRIPT, pdfPath, "", today || ""],
-      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (stderr) console.warn(`   ⚠️  parser stderr: ${stderr.trim().slice(0,200)}`);
-        if (err) { console.error(`   ❌ Parser error: ${err.message}`); return resolve([]); }
-        try {
-          const rows = JSON.parse(stdout);
-          if (!Array.isArray(rows)) return resolve([]);
-          const results = rows
-            .filter(r => r.producer || r.grn || r.commodity)
-            .map(r => ({
-              grn:        String(r.grn        || ""),
-              producer:   String(r.producer   || ""),
-              commodity:  String(r.commodity  || "UNK"),
-              pack:       String(r.pack       || ""),
-              variety:    String(r.variety    || "*"),
-              grade:      String(r.grade      || "1"),
-              size:       String(r.size       || "*"),
-              count:      String(r.count      || "*"),
-              flr:        Number(r.qty_sort)  || 0,
-              rec:        Number(r.qty_rec)   || 0,
-              arriveDate: r.date              || null,
-              stockDate:  today,
-              src:        filename,
-            }))
-            .filter(r => r.grn || r.producer);
-          console.log(`   ✅ Spatial parser: ${results.length} rows from ${filename}`);
-          resolve(results);
-        } catch(e) { console.error(`   ❌ JSON parse error: ${e.message}`); resolve([]); }
-      }
-    );
-  });
-}
-
 // ── Firebase & Drive init ─────────────────────────────────────────────────────
 let db;
 function initFirebase() {
@@ -180,7 +132,99 @@ async function downloadPdfToTemp(fileId, filename) {
   }
 }
 
-// ── Process a single floor balance file and push to Firebase ──────────────────
+// ── Process a single stock file ─────────────────────────────────────────────
+const PARSER_SCRIPT_STOCK = path.join(__dirname, "parse_stock_pdf.py");
+
+function parsePdfSpatial(pdfPath, filename, today) {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(PARSER_SCRIPT_STOCK)) { console.warn("   ⚠️  parse_stock_pdf.py not found"); return resolve([]); }
+    execFile("python3", [PARSER_SCRIPT_STOCK, pdfPath, "", today || ""],
+      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (stderr) console.warn(`   ⚠️  parser stderr: ${stderr.trim().slice(0,200)}`);
+        if (err) { console.error(`   ❌ Parser error: ${err.message}`); return resolve([]); }
+        try {
+          const rows = JSON.parse(stdout);
+          if (!Array.isArray(rows)) return resolve([]);
+          const results = rows
+            .filter(r => r.producer || r.grn || r.commodity)
+            .map(r => ({
+              grn:        String(r.grn        || ""),
+              producer:   String(r.producer   || ""),
+              commodity:  String(r.commodity  || "UNK"),
+              pack:       String(r.pack       || ""),
+              variety:    String(r.variety    || "*"),
+              grade:      String(r.grade      || "1"),
+              size:       String(r.size       || "*"),
+              count:      String(r.count      || "*"),
+              flr:        Number(r.qty_sort)  || 0,
+              rec:        Number(r.qty_rec)   || 0,
+              arriveDate: r.date              || null,
+              stockDate:  today,
+              src:        filename,
+            }))
+            .filter(r => r.grn || r.producer);
+          console.log(`   ✅ Spatial parser: ${results.length} rows from ${filename}`);
+          resolve(results);
+        } catch(e) { console.error(`   ❌ JSON parse error: ${e.message}`); resolve([]); }
+      }
+    );
+  });
+}
+
+async function processStockFile(fileId, filename) {
+  const base = filename.toLowerCase().replace(".pdf","");
+  let user = "unknown";
+  if      (base.includes("riaan")) user = "RJ";
+  else if (base.includes("cdw"))   user = "CW";
+  else if (base.includes("pot"))   user = "POT";
+
+  const dateMatch = filename.match(/^(\d{8})/);
+  const today = dateMatch ? dateMatch[1] : todayStr();
+
+  const tmpPath = await downloadPdfToTemp(fileId, filename);
+  if (!tmpPath) throw new Error("Download failed");
+
+  let rows = [];
+  try {
+    rows = await parsePdfSpatial(tmpPath, filename, today);
+    rows.forEach(r => r.user = user);
+  } finally {
+    try { fs.unlinkSync(tmpPath); } catch {}
+  }
+
+  if (rows.length === 0) {
+    console.log(`   ⚠️  No rows parsed from ${filename}`);
+    return 0;
+  }
+
+  const stockByGrn = {};
+  rows.forEach(r => {
+    stockByGrn[r.grn] = {
+      grn:        r.grn,
+      producer:   r.producer,
+      commodity:  r.commodity,
+      pack:       r.pack       || "",
+      variety:    r.variety    || "*",
+      grade:      r.grade      || "1",
+      size:       r.size       || "*",
+      count:      r.count      || "*",
+      qty_rec:    r.rec        || 0,
+      qty_sort:   r.flr        || 0,
+      date:       r.arriveDate || today,
+      user:       user,
+      source:     "drive",
+      uploadedAt: new Date().toISOString(),
+    };
+  });
+
+  await db.ref(`stock/${user}`).set(stockByGrn);
+  console.log(`   ✅ Stock pushed: /stock/${user} — ${rows.length} rows from ${filename}`);
+
+  return rows.length;
+}
+
+// ── Process Floor File ──────────────────────────────────────────────────────
 async function processFloorFile(fileId, filename) {
   const base = filename.toLowerCase().replace(".pdf","");
   let user = "unknown";
@@ -213,66 +257,11 @@ async function processFloorFile(fileId, filename) {
 
   if (rows.length === 0) { console.log(`   ⚠️  No rows from floor file ${filename}`); return 0; }
 
-  // Key by GRN+SEQ to avoid duplicates
   const floorByKey = {};
   rows.forEach(r => { floorByKey[r.grn + '_' + r.seq] = r; });
 
   await db.ref(`floor/${user}`).set(floorByKey);
   console.log(`   ✅ Floor pushed: /floor/${user} — ${rows.length} rows from ${filename}`);
-  return rows.length;
-}
-
-// ── Process a single stock file and push to Firebase ─────────────────────────
-async function processStockFile(fileId, filename) {
-  const base = filename.toLowerCase().replace(".pdf","");
-  let user = "unknown";
-  if      (base.includes("riaan")) user = "RJ";
-  else if (base.includes("cdw"))   user = "CW";
-  else if (base.includes("pot"))   user = "POT";
-
-  const dateMatch = filename.match(/^(\d{8})/);
-  const today = dateMatch ? dateMatch[1] : todayStr();
-
-  const tmpPath = await downloadPdfToTemp(fileId, filename);
-  if (!tmpPath) throw new Error("Download failed");
-
-  let rows = [];
-  try {
-    rows = await parsePdfSpatial(tmpPath, filename, today);
-    rows.forEach(r => r.user = user);
-  } finally {
-    try { fs.unlinkSync(tmpPath); } catch {}
-  }
-
-  if (rows.length === 0) {
-    console.log(`   ⚠️  No rows parsed from ${filename}`);
-    return 0;
-  }
-
-  // Build Firebase payload keyed by GRN
-  const stockByGrn = {};
-  rows.forEach(r => {
-    stockByGrn[r.grn] = {
-      grn:        r.grn,
-      producer:   r.producer,
-      commodity:  r.commodity,
-      pack:       r.pack       || "",
-      variety:    r.variety    || "*",
-      grade:      r.grade      || "1",
-      size:       r.size       || "*",
-      count:      r.count      || "*",
-      qty_rec:    r.rec        || 0,
-      qty_sort:   r.flr        || 0,
-      date:       r.arriveDate || today,
-      user:       user,
-      source:     "drive",
-      uploadedAt: new Date().toISOString(),
-    };
-  });
-
-  await db.ref(`stock/${user}`).set(stockByGrn);
-  console.log(`   ✅ Stock pushed: /stock/${user} — ${rows.length} rows from ${filename}`);
-
   return rows.length;
 }
 
@@ -323,7 +312,6 @@ async function sync() {
       console.log(`   ✅ Seeded ${SEED_HISTORY.length} transactions`);
     }
 
-    // Buyer history handled by Apps Script
     await syncStock();
   } catch(err) {
     console.error("❌ Sync error:", err.message);
@@ -333,7 +321,7 @@ async function sync() {
 // ── HTTP SERVER ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
 
-  // ── CORS preflight (must be first) ─────────────────────────────────────────
+  // ── CORS preflight ─────────────────────────────────────────────────────────
   if (req.method === "OPTIONS") {
     res.writeHead(204, {
       "Access-Control-Allow-Origin":  "*",
@@ -345,7 +333,8 @@ const server = http.createServer(async (req, res) => {
 
   // ── Health check ───────────────────────────────────────────────────────────
   if (req.method === "GET" && req.url === "/") {
-    return res.end("jdw-sync v10 alive");
+    res.writeHead(200);
+    return res.end("jdw-sync v11 alive");
   }
 
   // ── Trigger stock sync ─────────────────────────────────────────────────────
@@ -410,11 +399,7 @@ const server = http.createServer(async (req, res) => {
     });
     return;
   }
-  // ── Floor trigger health check (GET) ──────────────────────────────────────
-  if (req.method === "GET" && req.url === "/trigger-floor") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    return res.end(JSON.stringify({ status: "Floor sync endpoint ready", secret_required: true }));
-  }
+
   // ── AI Match endpoint ──────────────────────────────────────────────────────
   if (req.method === "POST" && req.url === "/ai-match") {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -437,7 +422,6 @@ const server = http.createServer(async (req, res) => {
           return res.end(JSON.stringify({ error: "GEMINI_API_KEY not set on server" }));
         }
 
-        // Model cascade: try 2.5-flash first, fall back to 1.5-flash if unavailable
         const MODELS = [
           "gemini-2.5-flash",
           "gemini-2.5-flash-lite",
@@ -446,7 +430,6 @@ const server = http.createServer(async (req, res) => {
         const MAX_RETRIES = 3;
         const RETRY_DELAY_MS = 2000;
 
-        // Promisified single Gemini call
         function callGemini(model, payload) {
           return new Promise((resolve, reject) => {
             const options = {
@@ -492,19 +475,17 @@ const server = http.createServer(async (req, res) => {
               console.log(`   🤖 Gemini attempt ${attempt}/${MAX_RETRIES} with ${model}`);
               const { parsed: geminiResp } = await callGemini(model, payload);
 
-              // 503 / UNAVAILABLE — retryable
               if (geminiResp.error?.code === 503 || geminiResp.error?.status === "UNAVAILABLE") {
                 lastError = `${model} unavailable (503)`;
                 console.warn(`   ⚠️  ${lastError} — attempt ${attempt}/${MAX_RETRIES}`);
                 if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
-                continue; // retry same model
+                continue;
               }
 
-              // Any other Gemini error — not retryable, try next model
               if (geminiResp.error) {
                 lastError = `${model}: ${geminiResp.error.message} (${geminiResp.error.status})`;
                 console.error(`   ❌ Gemini error on ${model}:`, JSON.stringify(geminiResp.error));
-                break; // skip remaining retries, try next model
+                break;
               }
 
               const text = geminiResp.candidates?.[0]?.content?.parts?.[0]?.text || "";
@@ -513,11 +494,9 @@ const server = http.createServer(async (req, res) => {
                 const reason = geminiResp.candidates?.[0]?.finishReason || "unknown";
                 lastError = `${model} empty response, finishReason: ${reason}`;
                 console.warn(`   ⚠️  ${lastError}`);
-                break; // try next model
+                break;
               }
 
-              // ✅ Gemini responded — validate JSON server-side
-              // If JSON is invalid (truncated), treat as a retryable error
               console.log(`   ✅ Gemini success with ${model} (attempt ${attempt})`);
               let parsed;
               try {
@@ -532,9 +511,8 @@ const server = http.createServer(async (req, res) => {
                 lastError = `JSON invalid: ${parseErr.message}`;
                 console.error(`   ❌ ${model} attempt ${attempt} JSON error: ${parseErr.message}`);
                 if (attempt < MAX_RETRIES) { await sleep(RETRY_DELAY_MS); continue; }
-                break; // exhausted retries for this model, try next
+                break;
               }
-              // Send clean re-encoded JSON — no bad chars can reach the browser
               res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
               return res.end(JSON.stringify({ content: [{ type: "text", text: JSON.stringify(parsed) }], model, preparse: true }));
 
@@ -546,7 +524,6 @@ const server = http.createServer(async (req, res) => {
           }
         }
 
-        // All models and retries exhausted
         console.error("   ❌ All Gemini models exhausted. Last error:", lastError);
         res.writeHead(503, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
         res.end(JSON.stringify({ error: "AI unavailable — all models exhausted. Last error: " + lastError }));
@@ -559,279 +536,67 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-
-
-  // ── PROCESS COLDSTORE SLIP (auto-detects type) ────────────────────────────
-  if (req.method === "POST" && req.url === "/process-coldstore-slip") {
+  // ===== TESSERACT OCR ENDPOINT =====
+  if (req.method === "POST" && req.url === "/ocr") {
     let body = "";
     req.on("data", chunk => body += chunk);
     req.on("end", async () => {
       try {
-        const { secret, fileId, filename } = JSON.parse(body);
-        if (secret !== TRIGGER_SECRET) { res.writeHead(403); return res.end(JSON.stringify({ error: "Unauthorized" })); }
-        if (!fileId) { res.writeHead(400); return res.end(JSON.stringify({ error: "fileId required" })); }
-
-        console.log(`\n❄️  Coldstore slip received: ${filename}`);
-
-        initDrive();
-        const fileMeta = await drive.files.get({ fileId, fields: "mimeType,name" });
-        const imageRes = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
-        const base64Image = Buffer.from(imageRes.data).toString("base64");
-        const mimeType = fileMeta.data.mimeType;
-
-        const geminiKey = process.env.GEMINI_API_KEY;
-        const prompt = `This is a Johannesburg Fresh Produce Market slip. There are 4 possible slip types:
-1. "STOCK TRANSFER TO IN-TRANSIT FOR DEPOSIT INTO COLDSTORE" - deposit initiated
-2. "STOCK DEPOSIT INTO COLD STORE" - deposit confirmed (has QTY SENT and QTY DEPOSITED)
-3. "WITHDRAWAL REQUEST FROM COLD STORE" - withdrawal initiated (has WITHDRAWAL NO and ORIGINAL DEPOSIT NO)
-4. "STOCK DEPOSIT ONTO AGENT FLOOR" - withdrawal confirmed, back on floor (has WITHDRAWAL NO, ORIGINAL DEPOSIT NO, QTY DEPOSITED)
-
-First identify which slip type this is (1, 2, 3, or 4), then extract fields. Return ONLY valid JSON:
-{
-  "slipType": 1, 2, 3, or 4,
-  "depositNo": "deposit number if present",
-  "withdrawalNo": "withdrawal number if present (slip type 3 or 4 only)",
-  "originalDepositNo": "original deposit number if present (slip type 3 or 4 only)",
-  "grn": "GRN number",
-  "date": "date as shown",
-  "commodity": "commodity code: Avocados=AVOS, Lemons=LEMS, Oranges=ORGS, Naartjies=NAAR, Clementines=CLTM, Grapefruit=GFT, Strawberries=BERS, Kiwifruit=KIWI",
-  "pack": "container/pack type",
-  "variety": "variety",
-  "grade": "class e.g. CL 1 or CL 2",
-  "size": "size or * if asterisk",
-  "count": "count number or empty",
-  "producer": "producer name",
-  "salesman": "salesman name",
-  "qty": "the relevant quantity - QTY SENT/TRANSFERRED for slip 1, QTY DEPOSITED for slip 2, QTY REQUESTED for slip 3, QTY DEPOSITED for slip 4",
-  "pallets": "number of pallets",
-  "fromLocation": "from location",
-  "toLocation": "to location"
-}
-Return ONLY the JSON object, no other text.`;
-
-        const geminiRes = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiKey}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{
-                parts: [
-                  { text: prompt },
-                  { inline_data: { mime_type: mimeType, data: base64Image } }
-                ]
-              }]
-            })
-          }
-        );
-
-        const geminiData = await geminiRes.json();
-        const text = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        console.log("   Gemini raw response:", text.slice(0, 500));
-        const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch) throw new Error("No JSON in Gemini response. Raw text: " + text.slice(0, 200));
-        const parsed = JSON.parse(jsonMatch[0]);
-
-        const slipType = parseInt(parsed.slipType);
-        parsed.filename = filename;
-        parsed.fileId = fileId;
-        parsed.processedAt = new Date().toISOString();
-
-        initFirebase();
-        const fb = require("firebase-admin");
-        const db = fb.database();
-
-        if (slipType === 1) {
-          // Transfer initiated - create record with status "in_transit"
-          const key = parsed.depositNo || Date.now().toString();
-          await db.ref("coldstore/" + key).set({
-            ...parsed,
-            status: "in_transit",
-            transferSlipAt: parsed.processedAt
-          });
-          console.log(`   ✅ Slip 1 (Transfer): Deposit ${parsed.depositNo} → in_transit`);
-        }
-        else if (slipType === 2) {
-          // Deposit confirmed - update status to "active" (officially in coldstore)
-          const key = parsed.depositNo || Date.now().toString();
-          await db.ref("coldstore/" + key).update({
-            ...parsed,
-            status: "active",
-            depositedAt: parsed.processedAt
-          });
-          console.log(`   ✅ Slip 2 (Deposit Confirmed): Deposit ${parsed.depositNo} → active`);
-        }
-        else if (slipType === 3) {
-          // Withdrawal requested - update status to "withdrawal_pending"
-          // Only update if the original deposit record actually exists (defensive check)
-          const key = parsed.originalDepositNo;
-          if (key) {
-            const existing = await db.ref("coldstore/" + key).once("value");
-            if (existing.exists()) {
-              await db.ref("coldstore/" + key).update({
-                status: "withdrawal_pending",
-                withdrawalNo: parsed.withdrawalNo,
-                withdrawalRequestedAt: parsed.processedAt
-              });
-              console.log(`   ✅ Slip 3 (Withdrawal Request): Deposit ${key} → withdrawal_pending`);
-            } else {
-              console.warn(`   ⚠️  Slip 3 (Withdrawal Request): No matching deposit ${key} found in coldstore — ignoring withdrawal, original deposit slip may be missing.`);
-            }
-          }
-        }
-        else if (slipType === 4) {
-          // Floor deposit confirmed - mark as "removed" (back on floor)
-          // Only update if the original deposit record actually exists (defensive check)
-          const key = parsed.originalDepositNo;
-          if (key) {
-            const existing = await db.ref("coldstore/" + key).once("value");
-            if (existing.exists()) {
-              await db.ref("coldstore/" + key).update({
-                status: "removed",
-                removedAt: parsed.processedAt
-              });
-              console.log(`   ✅ Slip 4 (Floor Confirmed): Deposit ${key} → removed (back on floor)`);
-            } else {
-              console.warn(`   ⚠️  Slip 4 (Floor Confirmed): No matching deposit ${key} found in coldstore — ignoring, original deposit slip may be missing.`);
-            }
-          }
-        }
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, slipType, data: parsed }));
-      } catch(e) {
-        console.error("❌ Coldstore slip error:", e.message);
-        res.writeHead(500);
-        res.end(JSON.stringify({ success: false, error: e.message }));
-      }
-    });
-    return;
-  }
-  // ── Process slip photo from mobile camera ────────────────────────────────
-  if (req.method === "POST" && req.url === "/process-slip-photo") {
-    // Handle multipart form data manually since we're not using express
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        // Parse multipart form data
-        const boundary = req.headers['content-type'].split('boundary=')[1];
-        if (!boundary) {
-          res.writeHead(400);
-          return res.end(JSON.stringify({ error: 'No boundary found' }));
-        }
-
-        // Simple multipart parser for the image
-        const parts = body.split('--' + boundary);
-        let imageData = null;
-        let secret = null;
-        let filename = 'slip_photo.jpg';
-
-        for (const part of parts) {
-          if (part.includes('Content-Disposition: form-data; name="secret"')) {
-            const match = part.match(/\r\n\r\n([\s\S]*?)\r\n--/);
-            if (match) secret = match[1].trim();
-          }
-          if (part.includes('Content-Disposition: form-data; name="image"')) {
-            const match = part.match(/\r\n\r\n([\s\S]*?)$/);
-            if (match) {
-              // Extract filename
-              const nameMatch = part.match(/filename="([^"]+)"/);
-              if (nameMatch) filename = nameMatch[1];
-              imageData = match[1];
-            }
-          }
-        }
-
-        // Validate secret
-        if (secret !== process.env.TRIGGER_SECRET) {
-          console.warn('⚠️ Invalid secret for slip photo');
-          res.writeHead(403);
-          return res.end(JSON.stringify({ error: 'Unauthorized' }));
-        }
-
+        const data = JSON.parse(body);
+        const imageData = data.image;
+        
         if (!imageData) {
-          res.writeHead(400);
-          return res.end(JSON.stringify({ error: 'No image uploaded' }));
+          res.writeHead(400, { "Content-Type": "application/json" });
+          return res.end(JSON.stringify({ error: "No image provided" }));
         }
-
-        // Remove any trailing characters
-        imageData = imageData.replace(/\r\n--$/, '');
-
-        // Save image to temp file
-        const tempPath = path.join(os.tmpdir(), filename);
-        fs.writeFileSync(tempPath, imageData, 'binary');
-        console.log(`📷 Processing photo: ${filename} (${imageData.length} bytes)`);
-
-        // Call Python PaddleOCR script
-        const { execFile } = require('child_process');
-        const parserScript = path.join(__dirname, 'parse_slip_pdf.py');
-
-        if (!fs.existsSync(parserScript)) {
-          console.error('❌ Parser script not found:', parserScript);
-          fs.unlink(tempPath, () => {});
-          res.writeHead(500);
-          return res.end(JSON.stringify({ error: 'Parser script not found' }));
+        
+        // Decode base64 image
+        let base64Data = imageData;
+        if (imageData.includes(',')) {
+          base64Data = imageData.split(',')[1];
         }
-
-        const result = await new Promise((resolve, reject) => {
-          execFile('python3', [parserScript, tempPath], { timeout: 120000 },
-            (err, stdout, stderr) => {
-              if (stderr) console.warn('Parser stderr:', stderr);
-              if (err) reject(new Error(stderr || err.message));
-              try {
-                resolve(JSON.parse(stdout));
-              } catch (e) {
-                reject(new Error('Parser output invalid JSON: ' + stdout.slice(0, 200)));
-              }
+        
+        const buffer = Buffer.from(base64Data, 'base64');
+        
+        console.log("📷 Processing OCR request...");
+        
+        // Run Tesseract OCR
+        const result = await Tesseract.recognize(buffer, 'eng', {
+          logger: (m) => {
+            if (m.status === 'recognizing text') {
+              console.log(`   OCR progress: ${Math.round(m.progress * 100)}%`);
             }
-          );
-        });
-
-        console.log(`📷 Parser returned ${result ? result.length : 0} transactions`);
-
-        // Save to Firebase
-        if (result && result.length > 0) {
-          const updates = {};
-          for (const row of result) {
-            const key = `history_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-            row.imported = new Date().toISOString();
-            row.source = 'mobile_photo';
-            updates[`/jdw/history/${key}`] = row;
           }
-          await db.ref().update(updates);
-
-          console.log(`✅ Saved ${result.length} transactions from photo`);
-
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true, count: result.length, data: result }));
-        } else {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: false, error: 'No data extracted from image' }));
-        }
-
-        // Clean up temp file
-        fs.unlink(tempPath, () => {});
-
-      } catch (error) {
-        console.error('Photo processing error:', error);
-        res.writeHead(500);
-        res.end(JSON.stringify({ error: error.message }));
+        });
+        
+        const text = result.data.text;
+        console.log(`📄 OCR complete: ${text.length} characters`);
+        
+        res.writeHead(200, { 
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*"
+        });
+        res.end(JSON.stringify({ text: text }));
+        
+      } catch (err) {
+        console.error("OCR Error:", err);
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
       }
     });
     return;
   }
+
   // ── 404 ────────────────────────────────────────────────────────────────────
   res.writeHead(404);
   res.end("Not found");
 });
 
-server.listen(process.env.PORT || 3000);
-console.log("🚀 jdw-sync v10 starting — polling 04:00-12:00 every 30 min + instant /trigger-stock");
-// Delay startup sync by 10s to allow service to fully start
+// ── Start Server ─────────────────────────────────────────────────────────────
+const PORT = process.env.PORT || 10000;
+server.listen(PORT);
+console.log(`🚀 jdw-sync v11 starting on port ${PORT} — polling 04:00-12:00 every 30 min + instant /trigger-stock`);
 setTimeout(sync, 10000);
-// Poll every 30 min between 04:00 and 12:00 (Johannesburg time = UTC+2)
-// Cron runs in UTC: 04:00 SAST = 02:00 UTC, 12:00 SAST = 10:00 UTC
 cron.schedule("0,30 2-10 * * *", () => {
   console.log(`[${new Date().toISOString()}] ⏰ Scheduled poll`);
   sync();
