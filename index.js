@@ -707,7 +707,120 @@ Return ONLY the JSON object, no other text.`;
     });
     return;
   }
+  // ── Process slip photo from mobile camera ────────────────────────────────
+  if (req.method === "POST" && req.url === "/process-slip-photo") {
+    // Handle multipart form data manually since we're not using express
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", async () => {
+      try {
+        // Parse multipart form data
+        const boundary = req.headers['content-type'].split('boundary=')[1];
+        if (!boundary) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ error: 'No boundary found' }));
+        }
 
+        // Simple multipart parser for the image
+        const parts = body.split('--' + boundary);
+        let imageData = null;
+        let secret = null;
+        let filename = 'slip_photo.jpg';
+
+        for (const part of parts) {
+          if (part.includes('Content-Disposition: form-data; name="secret"')) {
+            const match = part.match(/\r\n\r\n([\s\S]*?)\r\n--/);
+            if (match) secret = match[1].trim();
+          }
+          if (part.includes('Content-Disposition: form-data; name="image"')) {
+            const match = part.match(/\r\n\r\n([\s\S]*?)$/);
+            if (match) {
+              // Extract filename
+              const nameMatch = part.match(/filename="([^"]+)"/);
+              if (nameMatch) filename = nameMatch[1];
+              imageData = match[1];
+            }
+          }
+        }
+
+        // Validate secret
+        if (secret !== process.env.TRIGGER_SECRET) {
+          console.warn('⚠️ Invalid secret for slip photo');
+          res.writeHead(403);
+          return res.end(JSON.stringify({ error: 'Unauthorized' }));
+        }
+
+        if (!imageData) {
+          res.writeHead(400);
+          return res.end(JSON.stringify({ error: 'No image uploaded' }));
+        }
+
+        // Remove any trailing characters
+        imageData = imageData.replace(/\r\n--$/, '');
+
+        // Save image to temp file
+        const tempPath = path.join(os.tmpdir(), filename);
+        fs.writeFileSync(tempPath, imageData, 'binary');
+        console.log(`📷 Processing photo: ${filename} (${imageData.length} bytes)`);
+
+        // Call Python PaddleOCR script
+        const { execFile } = require('child_process');
+        const parserScript = path.join(__dirname, 'parse_slip_pdf.py');
+
+        if (!fs.existsSync(parserScript)) {
+          console.error('❌ Parser script not found:', parserScript);
+          fs.unlink(tempPath, () => {});
+          res.writeHead(500);
+          return res.end(JSON.stringify({ error: 'Parser script not found' }));
+        }
+
+        const result = await new Promise((resolve, reject) => {
+          execFile('python3', [parserScript, tempPath], { timeout: 120000 },
+            (err, stdout, stderr) => {
+              if (stderr) console.warn('Parser stderr:', stderr);
+              if (err) reject(new Error(stderr || err.message));
+              try {
+                resolve(JSON.parse(stdout));
+              } catch (e) {
+                reject(new Error('Parser output invalid JSON: ' + stdout.slice(0, 200)));
+              }
+            }
+          );
+        });
+
+        console.log(`📷 Parser returned ${result ? result.length : 0} transactions`);
+
+        // Save to Firebase
+        if (result && result.length > 0) {
+          const updates = {};
+          for (const row of result) {
+            const key = `history_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+            row.imported = new Date().toISOString();
+            row.source = 'mobile_photo';
+            updates[`/jdw/history/${key}`] = row;
+          }
+          await db.ref().update(updates);
+
+          console.log(`✅ Saved ${result.length} transactions from photo`);
+
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: true, count: result.length, data: result }));
+        } else {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ success: false, error: 'No data extracted from image' }));
+        }
+
+        // Clean up temp file
+        fs.unlink(tempPath, () => {});
+
+      } catch (error) {
+        console.error('Photo processing error:', error);
+        res.writeHead(500);
+        res.end(JSON.stringify({ error: error.message }));
+      }
+    });
+    return;
+  }
   // ── 404 ────────────────────────────────────────────────────────────────────
   res.writeHead(404);
   res.end("Not found");
