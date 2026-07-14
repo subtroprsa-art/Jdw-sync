@@ -1,6 +1,5 @@
 Flask
 flask-cors
-easyocr
+pytesseract
 Pillow
-numpy
-opencv-python-headless
+pdf2image
