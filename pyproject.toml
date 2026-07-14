@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "jdw-sync"
+version = "3.0.0"
+description = "JDW Sync Service"
+authors = ["Your Name <you@example.com>"]
+
+[tool.poetry.dependencies]
+python = "3.11.10"
+pdfplumber = "*"
+pytesseract = "*"
+pdf2image = "*"
+paddlepaddle = "2.5.2"
+paddleocr = "2.7.0"
+numpy = "1.24.4"
+opencv-python = "4.8.1.78"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
