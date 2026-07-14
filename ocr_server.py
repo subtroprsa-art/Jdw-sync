@@ -34,5 +34,9 @@ def ocr_image():
 
 if __name__ == '__main__':
     # Use a specific port for OCR, e.g., 5002
+
+@app.route('/')
+def home():
+    return 'OCR Server is running!'
     ocr_port = int(os.environ.get('OCR_PORT', 5002))
     app.run(host='0.0.0.0', port=ocr_port)
