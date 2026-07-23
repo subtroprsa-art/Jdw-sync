@@ -1,603 +1,138 @@
-/**
- * jdw-sync v11 - with Tesseract OCR
- */
+#!/usr/bin/env python3
+"""
+JDW Stock PDF Parser v5 - Layout Line Approach
+================================================
+Extracts commodity, pack, variety, grade, size, count from the comma-separated
+commodity field e.g. AVOS,TR040,AF,1,*,14,*
 
-const { google }   = require("googleapis");
-const admin        = require("firebase-admin");
-const http         = require("http");
-const cron         = require("node-cron");
-const https        = require("https");
-const Tesseract    = require("tesseract.js");
-const { execFile } = require("child_process");
-const fs           = require("fs");
-const os           = require("os");
-const path         = require("path");
+Usage:  python3 parse_stock_pdf.py <pdf> [username] [YYYY-MM-DD]
+Output: JSON array to stdout. Errors to stderr.
+"""
 
-const BUYER_HISTORY_FOLDER = process.env.DRIVE_BUYER_HISTORY_FOLDER_ID || "1DBmo42cx_YnQPqKOer1MFiH8onww5pZ6";
-const STOCK_SCANS_FOLDER   = process.env.DRIVE_STOCK_SCANS_FOLDER_ID   || "1DrYmim6xThu6KfKRplr5SDBVZc-BFMBm";
-const FIREBASE_DB_URL      = process.env.FIREBASE_DATABASE_URL;
-const PARSER_SCRIPT        = path.join(__dirname, "parse_stock_pdf.py");
-const FLOOR_PARSER_SCRIPT  = path.join(__dirname, "parse_floor_pdf.py");
-const TRIGGER_SECRET       = process.env.TRIGGER_SECRET || "jdw-trigger-2026";
+import sys, json, re
+import pdfplumber
 
-// Commodity full names
-const COMM_NAMES = {
-  AVOS:"Avocados", LEMS:"Lemons", FIGS:"Figs", KIWI:"Kiwifruit",
-  ORGS:"Oranges", GVS:"Guavas", CLTM:"Clementines", NAAR:"Naartjies",
-  STRS:"Strawberries", MANG:"Mangoes", DRAG:"Dragon Fruit", GFT:"Grapefruit",
-  SATS:"Satsumas", PAPO:"Papino",
-};
-
-// ── Seed history ─────────────────────────────────────────────────────────────
-const SEED_HISTORY = [
-  { buyer:"MANDELA MARKET",       grn:"15379866", commodity:"AVOS", variety:"AK", count:"8",  qty:30,  price:50,  date:"26/05/2026" },
-  { buyer:"MANDELA MARKET",       grn:"15379857", commodity:"AVOS", variety:"AK", count:"10", qty:10,  price:50,  date:"26/05/2026" },
-  { buyer:"MANDELA MARKET",       grn:"15379869", commodity:"AVOS", variety:"AK", count:"16", qty:120, price:50,  date:"26/05/2026" },
-  { buyer:"MANDELA MARKET",       grn:"15444973", commodity:"AVOS", variety:"MA", count:"22", qty:164, price:70,  date:"26/05/2026" },
-  { buyer:"DAY DREAMERS",         grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:60,  price:120, date:"26/05/2026" },
-  { buyer:"DAY DREAMERS",         grn:"15428753", commodity:"KIWI", variety:"*",  count:"20", qty:2,   price:200, date:"26/05/2026" },
-  { buyer:"SUNNINGHILL SUPER SP", grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:25,  price:120, date:"26/05/2026" },
-  { buyer:"DE AGUIAR HELIO GOME", grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:30,  price:120, date:"26/05/2026" },
-  { buyer:"PAULS FRUIT & VEG",    grn:"15416268", commodity:"LEMS", variety:"*",  count:"88", qty:2,   price:120, date:"26/05/2026" },
-  { buyer:"PAULS FRUIT & VEG",    grn:"15428726", commodity:"NAAR", variety:"HM", count:"12", qty:5,   price:14,  date:"26/05/2026" },
-  { buyer:"PAULS FRUIT & VEG",    grn:"15415663", commodity:"KIWI", variety:"*",  count:"20", qty:5,   price:160, date:"26/05/2026" },
-  { buyer:"PAULS FRUIT & VEG",    grn:"15444988", commodity:"AVOS", variety:"AH", count:"*",  qty:5,   price:162, date:"26/05/2026" },
-  { buyer:"GEBREYSUS KERIGA TEK", grn:"15397488", commodity:"AVOS", variety:"AH", count:"14", qty:84,  price:70,  date:"26/05/2026" },
-  { buyer:"FLM SA (PTY) LTD",     grn:"15442214", commodity:"KIWI", variety:"*",  count:"20", qty:75,  price:240, date:"26/05/2026" },
-  { buyer:"WELKOM MINI MARKET",   grn:"15415663", commodity:"KIWI", variety:"*",  count:"20", qty:37,  price:128, date:"26/05/2026" },
-  { buyer:"AFRICAN FRUIT CO",     grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:30,  price:100, date:"26/05/2026" },
-  { buyer:"MUSTAFA AGMAT",        grn:"15421261", commodity:"NAAR", variety:"LR", count:"1X", qty:104, price:60,  date:"26/05/2026" },
-  { buyer:"RANDGATE SPAR",        grn:"15429339", commodity:"AVOS", variety:"AF", count:"14", qty:10,  price:110, date:"26/05/2026" },
-  { buyer:"KATOMPA MWAMBA",       grn:"15428721", commodity:"NAAR", variety:"HM", count:"15", qty:400, price:10,  date:"26/05/2026" },
-  { buyer:"GO FRESH HOSPITALITY", grn:"15440606", commodity:"AVOS", variety:"AF", count:"12", qty:20,  price:100, date:"26/05/2026" },
-  { buyer:"RIVERSIDE FRESH",      grn:"15429339", commodity:"AVOS", variety:"AF", count:"14", qty:15,  price:100, date:"26/05/2026" },
-  { buyer:"FLM SA (PTY) LTD",     grn:"15398683", commodity:"DRAG", variety:"*",  count:"10", qty:160, price:160, date:"05/05/2026" },
-  { buyer:"FLM SA (PTY) LTD",     grn:"15403543", commodity:"GVS",  variety:"*",  count:"L",  qty:200, price:50,  date:"05/05/2026" },
-];
-
-// ── Helper functions ──────────────────────────────────────────────────────────
-function parseJSON(envVar, label) {
-  const raw = process.env[envVar];
-  if (!raw) throw new Error(`Missing env var: ${envVar} (${label})`);
-  try { return JSON.parse(raw); }
-  catch(e) { throw new Error(`Invalid JSON in ${envVar}: ${e.message}`); }
+MONTH_MAP = {
+    'JAN':'01','FEB':'02','MAR':'03','APR':'04','MAY':'05','JUN':'06',
+    'JUL':'07','AUG':'08','SEP':'09','OCT':'10','NOV':'11','DEC':'12',
 }
 
-function todayStr() {
-  const d = new Date();
-  return String(d.getDate()).padStart(2,"0") + String(d.getMonth()+1).padStart(2,"0") + d.getFullYear();
+PACK_NAMES = {
+    'TR040': '4KG TRAY',
+    'BG150': '15KG BAG',
+    'BG160': '16KG BAG',
+    'SP170': '17KG SPECIAL',
+    'CTT150': '15KG CARTON',
+    'PTB005': '500G PUNNET',
+    'PTB002': '160G PUNNET',
+    'DL076': 'DL 076 CARTON',
+    'PC030': '3KG POCKET',
+    'PC060': '6KG POCKET',
+    'ECO020': '2KG ECONO PACK',
 }
 
-// ── buildModel ────────────────────────────────────────────────────────────────
-function buildModel(history) {
-  const m = {};
-  for (const h of history) {
-    const b = h.buyer;
-    if (!b) continue;
-    const commodity = h.commodity || 'UNK';
-    const variety   = h.variety   || '*';
-    const count     = h.count     || h.size || '*';
-    const qty       = Number(h.qty)   || 0;
-    const price     = Number(h.price) || 0;
-    const date      = h.date || '';
-    const k = [commodity, variety, count].filter(v => v && v !== "*").join("|");
-    if (!m[b]) m[b] = {};
-    if (!m[b][k]) m[b][k] = { totalQty:0, txCount:0, priceSum:0, lastDate:"", commodity, variety, count };
-    m[b][k].totalQty += qty;
-    m[b][k].txCount  += 1;
-    m[b][k].priceSum += price * qty;
-    if (!m[b][k].lastDate || date > m[b][k].lastDate) m[b][k].lastDate = date;
-  }
-  for (const b of Object.keys(m))
-    for (const k of Object.keys(m[b])) {
-      const e = m[b][k];
-      e.avgPrice = e.totalQty > 0 ? e.priceSum / e.totalQty : 0;
-      e.score    = e.txCount * Math.log1p(e.totalQty);
-      e.avgQty   = e.txCount > 0 ? Math.round(e.totalQty / e.txCount) : 0;
-    }
-  return m;
-}
+SKIP = ['STOCK REPORT', 'JOHANNESBURG', 'AGENT:', 'SALESMAN:', 'Page', 'Printed', 
+        'PRODUCER', 'COMMODITY', 'GRN', 'REC', 'FLR', 'SORT']
 
-// ── Firebase & Drive init ─────────────────────────────────────────────────────
-let db;
-function initFirebase() {
-  if (db) return;
-  const sa = parseJSON("FIREBASE_SERVICE_ACCOUNT", "Firebase credentials");
-  if (!admin.apps.length) admin.initializeApp({ credential: admin.credential.cert(sa), databaseURL: FIREBASE_DB_URL });
-  db = admin.database();
-  console.log("✅ Firebase connected");
-}
+def parse_date(s):
+    m = re.match(r'(\d{1,2})[/\-]([A-Za-z]{3})[/\-](\d{4})', s)
+    if m:
+        d, mon, y = m.group(1), m.group(2).upper(), m.group(3)
+        return f"{y}-{MONTH_MAP.get(mon,'00')}-{d.zfill(2)}"
+    m = re.match(r'(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})', s)
+    if m:
+        return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
+    m = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', s)
+    if m:
+        d, mo, y = m.group(1), m.group(2), m.group(3)
+        if len(y) == 2: y = '20' + y
+        return f"{y}-{mo.zfill(2)}-{d.zfill(2)}"
+    return s
 
-let drive;
-function initDrive() {
-  if (drive) return;
-  const creds = parseJSON("GOOGLE_SERVICE_ACCOUNT", "Google credentials");
-  const auth  = new google.auth.GoogleAuth({ credentials: creds, scopes: ["https://www.googleapis.com/auth/drive.readonly"] });
-  drive = google.drive({ version: "v3", auth });
-  console.log("✅ Google Drive connected");
-}
-
-// ── Download PDF from Drive ───────────────────────────────────────────────────
-async function downloadPdfToTemp(fileId, filename) {
-  const tmpPath = path.join(os.tmpdir(), filename);
-  try {
-    const res = await drive.files.get({ fileId, alt: "media" }, { responseType: "arraybuffer" });
-    const buf = Buffer.from(res.data);
-    fs.writeFileSync(tmpPath, buf);
-    console.log(`   📥 Downloaded ${filename} (${buf.length} bytes)`);
-    return tmpPath;
-  } catch(e) {
-    console.warn(`   ⚠️  Download failed for ${filename}: ${e.message}`);
-    return null;
-  }
-}
-
-// ── Process a single stock file ─────────────────────────────────────────────
-const PARSER_SCRIPT_STOCK = path.join(__dirname, "parse_stock_pdf.py");
-
-function parsePdfSpatial(pdfPath, filename, today) {
-  return new Promise((resolve) => {
-    if (!fs.existsSync(PARSER_SCRIPT_STOCK)) { console.warn("   ⚠️  parse_stock_pdf.py not found"); return resolve([]); }
-    execFile("python3", [PARSER_SCRIPT_STOCK, pdfPath, "", today || ""],
-      { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (stderr) console.warn(`   ⚠️  parser stderr: ${stderr.trim().slice(0,200)}`);
-        if (err) { console.error(`   ❌ Parser error: ${err.message}`); return resolve([]); }
-        try {
-          const rows = JSON.parse(stdout);
-          if (!Array.isArray(rows)) return resolve([]);
-          const results = rows
-            .filter(r => r.producer || r.grn || r.commodity)
-            .map(r => ({
-              grn:        String(r.grn        || ""),
-              producer:   String(r.producer   || ""),
-              commodity:  String(r.commodity  || "UNK"),
-              pack:       String(r.pack       || ""),
-              variety:    String(r.variety    || "*"),
-              grade:      String(r.grade      || "1"),
-              size:       String(r.size       || "*"),
-              count:      String(r.count      || "*"),
-              flr:        Number(r.qty_sort)  || 0,
-              rec:        Number(r.qty_rec)   || 0,
-              arriveDate: r.date              || null,
-              stockDate:  today,
-              src:        filename,
-            }))
-            .filter(r => r.grn || r.producer);
-          console.log(`   ✅ Spatial parser: ${results.length} rows from ${filename}`);
-          resolve(results);
-        } catch(e) { console.error(`   ❌ JSON parse error: ${e.message}`); resolve([]); }
-      }
-    );
-  });
-}
-
-async function processStockFile(fileId, filename) {
-  const base = filename.toLowerCase().replace(".pdf","");
-  let user = "unknown";
-  if      (base.includes("riaan")) user = "RJ";
-  else if (base.includes("cdw"))   user = "CW";
-  else if (base.includes("pot"))   user = "POT";
-
-  const dateMatch = filename.match(/^(\d{8})/);
-  const today = dateMatch ? dateMatch[1] : todayStr();
-
-  const tmpPath = await downloadPdfToTemp(fileId, filename);
-  if (!tmpPath) throw new Error("Download failed");
-
-  let rows = [];
-  try {
-    rows = await parsePdfSpatial(tmpPath, filename, today);
-    rows.forEach(r => r.user = user);
-  } finally {
-    try { fs.unlinkSync(tmpPath); } catch {}
-  }
-
-  if (rows.length === 0) {
-    console.log(`   ⚠️  No rows parsed from ${filename}`);
-    return 0;
-  }
-
-  const stockByGrn = {};
-  rows.forEach(r => {
-    stockByGrn[r.grn] = {
-      grn:        r.grn,
-      producer:   r.producer,
-      commodity:  r.commodity,
-      pack:       r.pack       || "",
-      variety:    r.variety    || "*",
-      grade:      r.grade      || "1",
-      size:       r.size       || "*",
-      count:      r.count      || "*",
-      qty_rec:    r.rec        || 0,
-      qty_sort:   r.flr        || 0,
-      date:       r.arriveDate || today,
-      user:       user,
-      source:     "drive",
-      uploadedAt: new Date().toISOString(),
-    };
-  });
-
-  await db.ref(`stock/${user}`).set(stockByGrn);
-  console.log(`   ✅ Stock pushed: /stock/${user} — ${rows.length} rows from ${filename}`);
-
-  return rows.length;
-}
-
-// ── Process Floor File ──────────────────────────────────────────────────────
-async function processFloorFile(fileId, filename) {
-  const base = filename.toLowerCase().replace(".pdf","");
-  let user = "unknown";
-  if      (base.includes("riaan") || base.includes("rj")) user = "RJ";
-  else if (base.includes("cdw")   || base.includes("christoff")) user = "CW";
-  else if (base.includes("pot"))  user = "POT";
-
-  const dateMatch = filename.match(/(\d{8})/);
-  const today = dateMatch ? dateMatch[1] : todayStr();
-
-  const tmpPath = await downloadPdfToTemp(fileId, filename);
-  if (!tmpPath) throw new Error("Download failed");
-
-  let rows = [];
-  try {
-    rows = await new Promise((resolve) => {
-      if (!fs.existsSync(FLOOR_PARSER_SCRIPT)) { console.warn("   ⚠️  parse_floor_pdf.py not found"); return resolve([]); }
-      execFile("python3", [FLOOR_PARSER_SCRIPT, tmpPath, user, today],
-        { timeout: 120000, maxBuffer: 10 * 1024 * 1024 },
-        (err, stdout, stderr) => {
-          if (stderr) console.warn(`   ⚠️  floor parser stderr: ${stderr.trim().slice(0,200)}`);
-          if (err) { console.error(`   ❌ Floor parser error: ${err.message}`); return resolve([]); }
-          try { resolve(JSON.parse(stdout)); } catch(e) { console.error(`   ❌ Floor JSON parse: ${e.message}`); resolve([]); }
-        }
-      );
-    });
-  } finally {
-    try { fs.unlinkSync(tmpPath); } catch {}
-  }
-
-  if (rows.length === 0) { console.log(`   ⚠️  No rows from floor file ${filename}`); return 0; }
-
-  const floorByKey = {};
-  rows.forEach(r => { floorByKey[r.grn + '_' + r.seq] = r; });
-
-  await db.ref(`floor/${user}`).set(floorByKey);
-  console.log(`   ✅ Floor pushed: /floor/${user} — ${rows.length} rows from ${filename}`);
-  return rows.length;
-}
-
-// ── STOCK SYNC ────────────────────────────────────────────────────────────────
-const processedStockFiles = new Set();
-
-async function syncStock() {
-  console.log("   📦 Checking stock scans...");
-  try {
-    const res = await drive.files.list({
-      q: `'${STOCK_SCANS_FOLDER}' in parents and mimeType = 'application/pdf'`,
-      fields: "files(id,name,createdTime)",
-      pageSize: 200,
-      orderBy: "createdTime asc",
-    });
-    const allFiles = res.data.files || [];
-    const newFiles = allFiles.filter(f => !processedStockFiles.has(f.id));
-
-    if (newFiles.length === 0) { console.log("   ✅ No new stock files"); return; }
-    console.log(`   🔄 Processing ${newFiles.length} new stock file(s)...`);
-
-    for (const file of newFiles) {
-      try {
-        await processStockFile(file.id, file.name);
-        processedStockFiles.add(file.id);
-      } catch(e) {
-        console.error(`   ❌ ${file.name}: ${e.message}`);
-      }
-    }
-  } catch(e) {
-    console.error("   ❌ Stock sync error:", e.message);
-  }
-}
-
-// ── MAIN SYNC ─────────────────────────────────────────────────────────────────
-async function sync() {
-  console.log(`\n[${new Date().toISOString()}] 🔄 Sync started`);
-  try {
-    initFirebase();
-    initDrive();
-
-    const histSnap = await db.ref("jdw/history").once("value");
-    let history = histSnap.val();
-    if (!history || (Array.isArray(history) && history.length === 0)) {
-      console.log("   📦 Seeding base buyer history...");
-      const model = buildModel(SEED_HISTORY);
-      await db.ref("jdw").update({ history: SEED_HISTORY, model, lastSync: { ts: new Date().toISOString(), newRows: SEED_HISTORY.length, total: SEED_HISTORY.length, buyers: Object.keys(model).length } });
-      console.log(`   ✅ Seeded ${SEED_HISTORY.length} transactions`);
+def parse_comm_field(comm_str):
+    parts = [p.strip() for p in comm_str.split(',')]
+    return {
+        'commodity': parts[0] if len(parts) > 0 else 'UNK',
+        'pack':      parts[1] if len(parts) > 1 else '',
+        'variety':   parts[2] if len(parts) > 2 else '*',
+        'grade':     parts[3] if len(parts) > 3 else '1',
+        'size':      parts[4] if len(parts) > 4 else '*',
+        'count':     parts[5] if len(parts) > 5 else '*',
     }
 
-    await syncStock();
-  } catch(err) {
-    console.error("❌ Sync error:", err.message);
-  }
-}
+def parse_stock_pdf(pdf_path, user, date_str):
+    rows = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=3, y_tolerance=3)
+            if not words:
+                continue
 
-// ── HTTP SERVER ───────────────────────────────────────────────────────────────
-const server = http.createServer(async (req, res) => {
+            lines_by_y = {}
+            for w in words:
+                y = round(w['top'] / 4) * 4
+                lines_by_y.setdefault(y, []).append(w)
 
-  // ── CORS preflight ─────────────────────────────────────────────────────────
-  if (req.method === "OPTIONS") {
-    res.writeHead(204, {
-      "Access-Control-Allow-Origin":  "*",
-      "Access-Control-Allow-Headers": "Content-Type",
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS"
-    });
-    return res.end();
-  }
+            for y in sorted(lines_by_y):
+                lw = sorted(lines_by_y[y], key=lambda w: w['x0'])
+                text = ' '.join(w['text'] for w in lw)
 
-  // ── Health check ───────────────────────────────────────────────────────────
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200);
-    return res.end("jdw-sync v11 alive");
-  }
+                if any(s in text for s in SKIP):
+                    continue
 
-  // ── Trigger stock sync ─────────────────────────────────────────────────────
-  if (req.method === "POST" && req.url === "/trigger-stock") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        const { secret, fileId, filename } = JSON.parse(body);
-        if (secret !== TRIGGER_SECRET) {
-          res.writeHead(403);
-          return res.end(JSON.stringify({ error: "Unauthorized" }));
-        }
-        if (!fileId || !filename) {
-          res.writeHead(400);
-          return res.end(JSON.stringify({ error: "fileId and filename required" }));
-        }
-        console.log(`\n📡 Trigger received: ${filename} (${fileId})`);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "processing", filename }));
-        try {
-          initFirebase();
-          initDrive();
-          const count = await processStockFile(fileId, filename);
-          processedStockFiles.add(fileId);
-          console.log(`   ✅ Trigger complete: ${filename} → ${count} rows`);
-        } catch(e) {
-          console.error(`   ❌ Trigger processing error: ${e.message}`);
-        }
-      } catch(e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
-      }
-    });
-    return;
-  }
+                # Match commodity field format e.g. AVOS,TR040,AF,1,*,14,*
+                comm_match = re.search(r'([A-Z]{2,5},[A-Z0-9]{2,8},[A-Z*]+,(?:CL [123]|[A-Z0-9*]+),[^,\s]+,[^,\s]+,[*\w]+)', text)
+                if not comm_match:
+                    continue
 
-  // ── Trigger floor balance sync ────────────────────────────────────────────
-  if (req.method === "POST" && req.url === "/trigger-floor") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        const { secret, fileId, filename } = JSON.parse(body);
-        if (secret !== TRIGGER_SECRET) { res.writeHead(403); return res.end(JSON.stringify({ error: "Unauthorized" })); }
-        if (!fileId || !filename) { res.writeHead(400); return res.end(JSON.stringify({ error: "fileId and filename required" })); }
-        console.log(`\n📡 Floor trigger received: ${filename} (${fileId})`);
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ status: "processing", filename }));
-        try {
-          initFirebase();
-          initDrive();
-          const count = await processFloorFile(fileId, filename);
-          console.log(`   ✅ Floor trigger complete: ${filename} → ${count} rows`);
-        } catch(e) {
-          console.error(`   ❌ Floor trigger error: ${e.message}`);
-        }
-      } catch(e) {
-        res.writeHead(400);
-        res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
-      }
-    });
-    return;
-  }
+                cf = parse_comm_field(comm_match.group(1))
 
-  // ── AI Match endpoint ──────────────────────────────────────────────────────
-  if (req.method === "POST" && req.url === "/ai-match") {
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+                def col(x_min, x_max):
+                    return ' '.join(w['text'] for w in lw if x_min <= w['x0'] < x_max).strip()
 
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        const { prompt } = JSON.parse(body);
+                # Column positioning bounds
+                grn      = col(0, 150)
+                producer = col(150, 320)
+                qty_rec  = col(500, 560)
+                qty_sort = col(560, 620)
+                arr_date = col(620, 720)
 
-        if (!prompt) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "prompt required" }));
-        }
+                # Find digits in GRN and quantities
+                grn_num = re.sub(r'\D', '', grn)
+                if not grn_num:
+                    continue
 
-        const GEMINI_KEY = process.env.GEMINI_API_KEY;
-        if (!GEMINI_KEY) {
-          res.writeHead(500, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "GEMINI_API_KEY not set on server" }));
-        }
+                rec_val  = int(re.sub(r'\D', '', qty_rec)) if re.search(r'\d', qty_rec) else 0
+                sort_val = int(re.sub(r'\D', '', qty_sort)) if re.search(r'\d', qty_sort) else 0
 
-        const MODELS = [
-          "gemini-2.5-flash",
-          "gemini-2.5-flash-lite",
-          "gemini-3.5-flash",
-        ];
-        const MAX_RETRIES = 3;
-        const RETRY_DELAY_MS = 2000;
+                rows.append({
+                    'grn':       grn_num,
+                    'producer':  producer,
+                    'commodity': cf['commodity'],
+                    'pack':      cf['pack'],
+                    'variety':   cf['variety'],
+                    'grade':     cf['grade'],
+                    'size':      cf['size'],
+                    'count':     cf['count'],
+                    'qty_rec':   rec_val,
+                    'qty_sort':  sort_val,
+                    'date':      parse_date(arr_date) if arr_date else date_str,
+                    'user':      user
+                })
+    return rows
 
-        function callGemini(model, payload) {
-          return new Promise((resolve, reject) => {
-            const options = {
-              hostname: "generativelanguage.googleapis.com",
-              path:     `/v1beta/models/${model}:generateContent`,
-              method:   "POST",
-              headers: {
-                "Content-Type":   "application/json",
-                "x-goog-api-key": GEMINI_KEY,
-                "Content-Length": Buffer.byteLength(payload)
-              }
-            };
-            const apiReq = https.request(options, (apiRes) => {
-              let data = "";
-              apiRes.on("data", chunk => data += chunk);
-              apiRes.on("end", () => {
-                try {
-                  resolve({ parsed: JSON.parse(data), raw: data });
-                } catch(e) {
-                  reject(new Error("JSON parse error: " + e.message + " | raw: " + data.slice(0, 300)));
-                }
-              });
-            });
-            apiReq.on("error", (e) => reject(new Error("Network error: " + e.message)));
-            apiReq.write(payload);
-            apiReq.end();
-          });
-        }
-
-        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-        const payload = JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { maxOutputTokens: 3000, temperature: 0.1, response_mime_type: "application/json" },
-          systemInstruction: { parts: [{ text: "You are a JSON API. Respond with valid JSON only. No markdown, no explanation, no text before or after the JSON object." }] }
-        });
-
-        let lastError = null;
-
-        for (const model of MODELS) {
-          for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-            try {
-              console.log(`   🤖 Gemini attempt ${attempt}/${MAX_RETRIES} with ${model}`);
-              const { parsed: geminiResp } = await callGemini(model, payload);
-
-              if (geminiResp.error?.code === 503 || geminiResp.error?.status === "UNAVAILABLE") {
-                lastError = `${model} unavailable (503)`;
-                console.warn(`   ⚠️  ${lastError} — attempt ${attempt}/${MAX_RETRIES}`);
-                if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
-                continue;
-              }
-
-              if (geminiResp.error) {
-                lastError = `${model}: ${geminiResp.error.message} (${geminiResp.error.status})`;
-                console.error(`   ❌ Gemini error on ${model}:`, JSON.stringify(geminiResp.error));
-                break;
-              }
-
-              const text = geminiResp.candidates?.[0]?.content?.parts?.[0]?.text || "";
-
-              if (!text) {
-                const reason = geminiResp.candidates?.[0]?.finishReason || "unknown";
-                lastError = `${model} empty response, finishReason: ${reason}`;
-                console.warn(`   ⚠️  ${lastError}`);
-                break;
-              }
-
-              console.log(`   ✅ Gemini success with ${model} (attempt ${attempt})`);
-              let parsed;
-              try {
-                let s = text.replace(/```json\s*/gi,'').replace(/```\s*/g,'').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g,'').trim();
-                let start = s.indexOf('{'), end = s.lastIndexOf('}');
-                if (start === -1 || end <= start) throw new Error('No JSON object found');
-                let jsonStr = s.slice(start, end + 1).replace(/,\s*([\]\}])/g, '$1');
-                parsed = JSON.parse(jsonStr);
-                if (!parsed.matches || !Array.isArray(parsed.matches)) throw new Error('Missing matches array');
-                console.log(`   ✅ Server JSON parse OK — ${parsed.matches.length} matches`);
-              } catch(parseErr) {
-                lastError = `JSON invalid: ${parseErr.message}`;
-                console.error(`   ❌ ${model} attempt ${attempt} JSON error: ${parseErr.message}`);
-                if (attempt < MAX_RETRIES) { await sleep(RETRY_DELAY_MS); continue; }
-                break;
-              }
-              res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-              return res.end(JSON.stringify({ content: [{ type: "text", text: JSON.stringify(parsed) }], model, preparse: true }));
-
-            } catch(e) {
-              lastError = e.message;
-              console.error(`   ❌ ${model} attempt ${attempt} threw: ${e.message}`);
-              if (attempt < MAX_RETRIES) await sleep(RETRY_DELAY_MS);
-            }
-          }
-        }
-
-        console.error("   ❌ All Gemini models exhausted. Last error:", lastError);
-        res.writeHead(503, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ error: "AI unavailable — all models exhausted. Last error: " + lastError }));
-
-      } catch(e) {
-        res.writeHead(400, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
-        res.end(JSON.stringify({ error: "Invalid JSON: " + e.message }));
-      }
-    });
-    return;
-  }
-
-  // ===== TESSERACT OCR ENDPOINT =====
-  if (req.method === "POST" && req.url === "/ocr") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        const data = JSON.parse(body);
-        const imageData = data.image;
+if __name__ == '__main__':
+    if len(sys.argv) < 2:
+        print('[]')
+        sys.exit(0)
         
-        if (!imageData) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          return res.end(JSON.stringify({ error: "No image provided" }));
-        }
-        
-        // Decode base64 image
-        let base64Data = imageData;
-        if (imageData.includes(',')) {
-          base64Data = imageData.split(',')[1];
-        }
-        
-        const buffer = Buffer.from(base64Data, 'base64');
-        
-        console.log("📷 Processing OCR request...");
-        
-        // Run Tesseract OCR
-        const result = await Tesseract.recognize(buffer, 'eng', {
-          logger: (m) => {
-            if (m.status === 'recognizing text') {
-              console.log(`   OCR progress: ${Math.round(m.progress * 100)}%`);
-            }
-          }
-        });
-        
-        const text = result.data.text;
-        console.log(`📄 OCR complete: ${text.length} characters`);
-        
-        res.writeHead(200, { 
-          "Content-Type": "application/json",
-          "Access-Control-Allow-Origin": "*"
-        });
-        res.end(JSON.stringify({ text: text }));
-        
-      } catch (err) {
-        console.error("OCR Error:", err);
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: err.message }));
-      }
-    });
-    return;
-  }
-
-  // ── 404 ────────────────────────────────────────────────────────────────────
-  res.writeHead(404);
-  res.end("Not found");
-});
-
-// ── Start Server ─────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 10000;
-server.listen(PORT);
-console.log(`🚀 jdw-sync v11 starting on port ${PORT} — polling 04:00-12:00 every 30 min + instant /trigger-stock`);
-setTimeout(sync, 10000);
-cron.schedule("0,30 2-10 * * *", () => {
-  console.log(`[${new Date().toISOString()}] ⏰ Scheduled poll`);
-  sync();
-});
+    pdf_path = sys.argv[1]
+    user     = sys.argv[2] if len(sys.argv) > 2 else 'unknown'
+    date_str = sys.argv[3] if len(sys.argv) > 3 else ''
+    
+    try:
+        results = parse_stock_pdf(pdf_path, user, date_str)
+        print(json.dumps(results))
+    except Exception as e:
+        sys.stderr.write(f'Error parsing stock PDF: {e}\n')
+        print('[]')
