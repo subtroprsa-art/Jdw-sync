@@ -52,12 +52,16 @@ async function handlePdfProcessing(req, res, isFloor) {
         .pipe(dest);
     });
 
-    // Determine user tag (RJ, CW/CDW, or POT)
+    // Determine user tag (RJ, CDW, or POT) matching frontend expectations
     const base = filename.toLowerCase();
     let user = 'UNKNOWN';
-    if (base.includes('riaan') || base.includes('rj')) user = 'RJ';
-    else if (base.includes('cdw') || base.includes('cw')) user = 'CW';
-    else if (base.includes('pot')) user = 'POT';
+    if (base.includes('riaan') || base.includes('rj')) {
+      user = 'RJ';
+    } else if (base.includes('cdw') || base.includes('cw')) {
+      user = 'CDW';
+    } else if (base.includes('pot')) {
+      user = 'POT';
+    }
 
     const scriptName = isFloor ? 'parse_floor_pdf.py' : 'parse_stock_pdf.py';
     const pythonScript = path.join(__dirname, scriptName);
