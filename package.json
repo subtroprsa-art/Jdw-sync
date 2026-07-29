@@ -15,4 +15,4 @@
 }
 ```[cite: 2]
 
-Once you push this update to GitHub (or save it on Render), make sure your Render build command is set to `npm install` and trigger a manual redeploy. Render will pull `express` and boot up cleanly.
+Once saved with valid JSON formatting, Render will boot up successfully and clear that crash error.
