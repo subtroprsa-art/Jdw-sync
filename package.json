@@ -6,9 +6,13 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "express": "^4.19.2",
     "firebase-admin": "^12.0.0",
     "googleapis": "^140.0.0",
     "node-cron": "^3.0.3",
     "tesseract.js": "^5.0.0"
   }
 }
+```[cite: 2]
+
+Once you push this update to GitHub (or save it on Render), make sure your Render build command is set to `npm install` and trigger a manual redeploy. Render will pull `express` and boot up cleanly.
