@@ -23,7 +23,8 @@ const drive = google.drive({ version: 'v3', auth });
 
 const TRIGGER_SECRET = process.env.TRIGGER_SECRET || 'jdw-trigger-2026';
 
-app.post('/trigger-stock', async (req, res) => {
+// Helper function to download file from Google Drive and run a Python script parser
+async function handlePdfProcessing(req, res, isFloor) {
   const { secret, fileId, filename } = req.body;
 
   if (secret !== TRIGGER_SECRET) {
@@ -34,7 +35,7 @@ app.post('/trigger-stock', async (req, res) => {
     return res.status(400).json({ error: 'Missing fileId or filename' });
   }
 
-  console.log(`📡 Trigger received: ${filename} (${fileId})`);
+  console.log(`📡 ${isFloor ? 'Floor' : 'Stock'} Trigger received: ${filename} (${fileId})`);
   const tempFilePath = path.join('/tmp', `${Date.now()}_${filename}`);
 
   try {
@@ -51,19 +52,17 @@ app.post('/trigger-stock', async (req, res) => {
         .pipe(dest);
     });
 
-    // Determine user tag and whether it's a floor report or stock report
+    // Determine user tag (RJ, CW/CDW, or POT)
     const base = filename.toLowerCase();
     let user = 'UNKNOWN';
     if (base.includes('riaan') || base.includes('rj')) user = 'RJ';
     else if (base.includes('cdw') || base.includes('cw')) user = 'CW';
     else if (base.includes('pot')) user = 'POT';
 
-    // Choose parser script: use parse_floor_pdf.py if it's a floor report, else parse_stock_pdf.py
-    const isFloorReport = base.includes('floor') || base.includes('bal');
-    const scriptName = isFloorReport ? 'parse_floor_pdf.py' : 'parse_stock_pdf.py';
+    const scriptName = isFloor ? 'parse_floor_pdf.py' : 'parse_stock_pdf.py';
     const pythonScript = path.join(__dirname, scriptName);
     
-    const scriptArgs = isFloorReport 
+    const scriptArgs = isFloor 
       ? [pythonScript, tempFilePath, user, new Date().toISOString().split('T')[0]]
       : [pythonScript, tempFilePath];
 
@@ -71,18 +70,17 @@ app.post('/trigger-stock', async (req, res) => {
       if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
 
       if (error) {
-        console.error(`❌ Python execution error: ${stderr}`);
+        console.error(`❌ Python execution error (${scriptName}): ${stderr}`);
         return res.status(500).json({ error: stderr || error.message });
       }
 
       try {
         const resultData = JSON.parse(stdout);
         
-        // Handle floor balance array format vs stock audit object format
         let rows = [];
         let dbPath = '';
 
-        if (isFloorReport) {
+        if (isFloor) {
           rows = Array.isArray(resultData) ? resultData : [];
           dbPath = `floorBalance/${user}`;
         } else {
@@ -95,7 +93,6 @@ app.post('/trigger-stock', async (req, res) => {
           return res.status(422).json({ error: 'Parser returned 0 rows.', output: resultData });
         }
 
-        // Map data by GRN for Firebase storage
         const dataByGrn = {};
         rows.forEach(r => {
           const key = r.grn || `row_${Math.random()}`;
@@ -114,7 +111,7 @@ app.post('/trigger-stock', async (req, res) => {
           filename: filename,
           user: user,
           rows_processed: rows.length,
-          type: isFloorReport ? 'floor_balance' : 'stock'
+          type: isFloor ? 'floor_balance' : 'stock'
         });
 
       } catch (parseErr) {
@@ -127,6 +124,16 @@ app.post('/trigger-stock', async (req, res) => {
     if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
     return res.status(500).json({ error: err.message });
   }
+}
+
+// Endpoint 1: Stock Scans
+app.post('/trigger-stock', async (req, res) => {
+  await handlePdfProcessing(req, res, false);
+});
+
+// Endpoint 2: Floor Balance Scans
+app.post('/trigger-floor', async (req, res) => {
+  await handlePdfProcessing(req, res, true);
 });
 
 const PORT = process.env.PORT || 10000;
