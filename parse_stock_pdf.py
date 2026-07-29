@@ -1,4 +1,5 @@
 import pdfplumber
+import re
 import sys
 import json
 
@@ -11,14 +12,22 @@ def parse_stock_report(pdf_path):
                 if text:
                     for line in text.split("\n"):
                         line_clean = line.strip()
-                        if line_clean:
-                            # Print each raw line to stdout for your Render logs so we can see it
-                            parsed_records.append([line_clean])
+                        if not line_clean:
+                            continue
+                            
+                        line_lower = line_clean.lower()
+                        # Skip summary and bag total rows (e.g., 15kg, 20kg totals)
+                        if "total" in line_lower or re.search(r'\d+\s*kg', line_lower):
+                            continue
+                            
+                        # Split the line into distinct columns based on multi-space gaps
+                        columns = [col.strip() for col in re.split(r'\s{2,}', line_clean) if col.strip()]
+                        if columns:
+                            parsed_records.append(columns)
+                            
     except Exception as e:
-        # Print error to stderr so it doesn't break JSON output
         print(f"Error parsing PDF: {str(e)}", file=sys.stderr)
 
-    # Always output a valid JSON array so Node.js never crashes
     print(json.dumps(parsed_records))
 
 if __name__ == "__main__":
