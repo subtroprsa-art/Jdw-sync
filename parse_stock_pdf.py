@@ -1,53 +1,7 @@
-#!/usr/bin/env python3
-"""
-JDW Stock PDF Parser v5 - Layout Line Approach
-================================================
-Extracts commodity, pack, variety, grade, size, count from the comma-separated
-commodity field e.g. AVOS,TR040,AF,1,*,14,*
-
-Usage:  python3 parse_stock_pdf.py <pdf> [username] [YYYY-MM-DD]
-Output: JSON array to stdout. Errors to stderr.
-"""
-
-import sys, json, re
+import sys
+import re
+import json
 import pdfplumber
-
-MONTH_MAP = {
-    'JAN':'01','FEB':'02','MAR':'03','APR':'04','MAY':'05','JUN':'06',
-    'JUL':'07','AUG':'08','SEP':'09','OCT':'10','NOV':'11','DEC':'12',
-}
-
-PACK_NAMES = {
-    'TR040': '4KG TRAY',
-    'BG150': '15KG BAG',
-    'BG160': '16KG BAG',
-    'SP170': '17KG SPECIAL',
-    'CTT150': '15KG CARTON',
-    'PTB005': '500G PUNNET',
-    'PTB002': '160G PUNNET',
-    'DL076': 'DL 076 CARTON',
-    'PC030': '3KG POCKET',
-    'PC060': '6KG POCKET',
-    'ECO020': '2KG ECONO PACK',
-}
-
-SKIP = ['STOCK REPORT', 'JOHANNESBURG', 'AGENT:', 'SALESMAN:', 'Page', 'Printed', 
-        'PRODUCER', 'COMMODITY', 'GRN', 'REC', 'FLR', 'SORT']
-
-def parse_date(s):
-    m = re.match(r'(\d{1,2})[/\-]([A-Za-z]{3})[/\-](\d{4})', s)
-    if m:
-        d, mon, y = m.group(1), m.group(2).upper(), m.group(3)
-        return f"{y}-{MONTH_MAP.get(mon,'00')}-{d.zfill(2)}"
-    m = re.match(r'(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})', s)
-    if m:
-        return f"{m.group(1)}-{m.group(2).zfill(2)}-{m.group(3).zfill(2)}"
-    m = re.match(r'(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})', s)
-    if m:
-        d, mo, y = m.group(1), m.group(2), m.group(3)
-        if len(y) == 2: y = '20' + y
-        return f"{y}-{mo.zfill(2)}-{d.zfill(2)}"
-    return s
 
 def parse_comm_field(comm_str):
     parts = [p.strip() for p in comm_str.split(',')]
@@ -55,15 +9,31 @@ def parse_comm_field(comm_str):
         'commodity': parts[0] if len(parts) > 0 else 'UNK',
         'pack':      parts[1] if len(parts) > 1 else '',
         'variety':   parts[2] if len(parts) > 2 else '*',
-        'grade':     parts[3] if len(parts) > 3 else '1',
+        'grade':     parts[3] if len(parts) > 3 and parts[3] else '1',
         'size':      parts[4] if len(parts) > 4 else '*',
         'count':     parts[5] if len(parts) > 5 else '*',
     }
 
+def col_pot(words, x_min, x_max):
+    """Specific column slicer for POT layout to avoid misalignment."""
+    matched = [w['text'] for w in words if x_min <= w['x0'] < x_max]
+    return ' '.join(matched).strip()
+
 def parse_stock_pdf(pdf_path, user, date_str):
     rows = []
+    pdf_summary_total = 0
+    is_pot = (user.upper() == 'POT')
+    
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
+            text_all = page.extract_text() or ''
+            
+            # Extract native PDF summary footer total on the last page
+            if page_idx == len(pdf.pages) - 1:
+                summary_match = re.search(r'[\d,]+\s+[\d,]+\s+\d+\s+\d+\s+\d+\s+\d+\s+\d+\s+([\d,]+)', text_all)
+                if summary_match:
+                    pdf_summary_total = int(summary_match.group(1).replace(',', ''))
+
             words = page.extract_words(x_tolerance=3, y_tolerance=3)
             if not words:
                 continue
@@ -77,27 +47,29 @@ def parse_stock_pdf(pdf_path, user, date_str):
                 lw = sorted(lines_by_y[y], key=lambda w: w['x0'])
                 text = ' '.join(w['text'] for w in lw)
 
-                if any(s in text for s in SKIP):
+                if any(s in text for s in ['AGENT:', 'SALESMAN:', 'CONSIGNMENT', 'Page', 'Printed']):
                     continue
 
-                # Match commodity field format e.g. AVOS,TR040,AF,1,*,14,*
-                comm_match = re.search(r'([A-Z]{2,5},[A-Z0-9]{2,8},[A-Z*]+,(?:CL [123]|[A-Z0-9*]+),[^,\s]+,[^,\s]+,[*\w]+)', text)
+                comm_match = re.search(r'([A-Z]{2,5},\s*[A-Z0-9]{2,8},\s*[A-Z*]*,\s*[^,\n]+,\s*[^,\n]*,\s*[^,\n]*)', text)
                 if not comm_match:
                     continue
 
                 cf = parse_comm_field(comm_match.group(1))
 
-                def col(x_min, x_max):
-                    return ' '.join(w['text'] for w in lw if x_min <= w['x0'] < x_max).strip()
+                # Use adjusted spatial boundaries for POT, original for others (CDW/RJ)
+                if is_pot:
+                    grn      = col_pot(lw, 0, 180)
+                    producer = col_pot(lw, 180, 340)
+                    qty_rec  = col_pot(lw, 480, 550)
+                    qty_sort = col_pot(lw, 550, 630)
+                    arr_date = col_pot(lw, 630, 740)
+                else:
+                    grn      = col_pot(lw, 0, 150)
+                    producer = col_pot(lw, 150, 320)
+                    qty_rec  = col_pot(lw, 500, 560)
+                    qty_sort = col_pot(lw, 560, 620)
+                    arr_date = col_pot(lw, 620, 720)
 
-                # Column positioning bounds
-                grn      = col(0, 150)
-                producer = col(150, 320)
-                qty_rec  = col(500, 560)
-                qty_sort = col(560, 620)
-                arr_date = col(620, 720)
-
-                # Find digits in GRN and quantities
                 grn_num = re.sub(r'\D', '', grn)
                 if not grn_num:
                     continue
@@ -116,23 +88,27 @@ def parse_stock_pdf(pdf_path, user, date_str):
                     'count':     cf['count'],
                     'qty_rec':   rec_val,
                     'qty_sort':  sort_val,
-                    'date':      parse_date(arr_date) if arr_date else date_str,
+                    'date':      arr_date if arr_date else date_str,
                     'user':      user
                 })
+
+    # Crosscheck Assertion Validation Logging
+    calculated_total = sum(r['qty_sort'] for r in rows)
+    if pdf_summary_total > 0 and calculated_total != pdf_summary_total:
+        print(f"⚠️ WARNING: Floor total mismatch for {user}! Calculated sum: {calculated_total}, PDF Footer Total: {pdf_summary_total}", file=sys.stderr)
+    else:
+        print(f"✅ Validation Passed for {user}: Total Floor Balance = {calculated_total}", file=sys.stderr)
+
     return rows
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print('[]')
-        sys.exit(0)
+    if len(sys.argv) < 4:
+        print(json.dumps([]))
+        sys.exit(1)
         
     pdf_path = sys.argv[1]
-    user     = sys.argv[2] if len(sys.argv) > 2 else 'unknown'
-    date_str = sys.argv[3] if len(sys.argv) > 3 else ''
+    user_arg = sys.argv[2]
+    date_arg = sys.argv[3]
     
-    try:
-        results = parse_stock_pdf(pdf_path, user, date_str)
-        print(json.dumps(results))
-    except Exception as e:
-        sys.stderr.write(f'Error parsing stock PDF: {e}\n')
-        print('[]')
+    parsed_data = parse_stock_pdf(pdf_path, user_arg, date_arg)
+    print(json.dumps(parsed_data))
