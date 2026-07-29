@@ -8,7 +8,6 @@ const { google } = require('googleapis');
 const app = express();
 app.use(express.json());
 
-// Initialize Firebase Admin
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
@@ -16,7 +15,6 @@ admin.initializeApp({
 });
 const db = admin.database();
 
-// Initialize Google Drive API auth
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || '{}'),
   scopes: ['https://www.googleapis.com/auth/drive.readonly']
@@ -37,11 +35,9 @@ app.post('/trigger-stock', async (req, res) => {
   }
 
   console.log(`📡 Trigger received: ${filename} (${fileId})`);
-
   const tempFilePath = path.join('/tmp', `${Date.now()}_${filename}`);
 
   try {
-    // 1. Download PDF from Google Drive
     const dest = fs.createWriteStream(tempFilePath);
     const response = await drive.files.get(
       { fileId: fileId, alt: 'media' },
@@ -50,19 +46,28 @@ app.post('/trigger-stock', async (req, res) => {
 
     await new Promise((resolve, reject) => {
       response.data
-        .on('end', () => {
-          console.log(`   📥 Downloaded ${filename} (${fs.statSync(tempFilePath).size} bytes)`);
-          resolve();
-        })
+        .on('end', () => resolve())
         .on('error', err => reject(err))
         .pipe(dest);
     });
 
-    // 2. Execute Python parser (parse_stock_pdf.py)
-    const pythonScript = path.join(__dirname, 'parse_stock_pdf.py');
+    // Determine user tag and whether it's a floor report or stock report
+    const base = filename.toLowerCase();
+    let user = 'UNKNOWN';
+    if (base.includes('riaan') || base.includes('rj')) user = 'RJ';
+    else if (base.includes('cdw') || base.includes('cw')) user = 'CW';
+    else if (base.includes('pot')) user = 'POT';
+
+    // Choose parser script: use parse_floor_pdf.py if it's a floor report, else parse_stock_pdf.py
+    const isFloorReport = base.includes('floor') || base.includes('bal');
+    const scriptName = isFloorReport ? 'parse_floor_pdf.py' : 'parse_stock_pdf.py';
+    const pythonScript = path.join(__dirname, scriptName);
     
-    execFile('python3', [pythonScript, tempFilePath], async (error, stdout, stderr) => {
-      // Clean up local temp file immediately
+    const scriptArgs = isFloorReport 
+      ? [pythonScript, tempFilePath, user, new Date().toISOString().split('T')[0]]
+      : [pythonScript, tempFilePath];
+
+    execFile('python3', scriptArgs, async (error, stdout, stderr) => {
       if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
 
       if (error) {
@@ -71,44 +76,45 @@ app.post('/trigger-stock', async (req, res) => {
       }
 
       try {
-        const auditResult = JSON.parse(stdout);
+        const resultData = JSON.parse(stdout);
         
-        console.log(`   🔍 Audit Status: ${auditResult.status} | Rows: ${auditResult.total_rows} | Qty Rec: ${auditResult.calculated_qty_rec} | Qty Sort: ${auditResult.calculated_qty_sort}`);
+        // Handle floor balance array format vs stock audit object format
+        let rows = [];
+        let dbPath = '';
 
-        if (auditResult.status !== 'PASSED' || auditResult.total_rows === 0) {
-          console.error(`❌ Audit FAILED for ${filename}. Push to Firebase aborted.`);
-          return res.status(422).json({ error: 'Stock audit failed validation checks.', audit: auditResult });
+        if (isFloorReport) {
+          rows = Array.isArray(resultData) ? resultData : [];
+          dbPath = `floorBalance/${user}`;
+        } else {
+          rows = resultData.records || [];
+          dbPath = `stock/${user}`;
         }
 
-        const rows = auditResult.records;
+        if (rows.length === 0) {
+          console.error(`⚠️ No rows parsed from ${filename} using ${scriptName}`);
+          return res.status(422).json({ error: 'Parser returned 0 rows.', output: resultData });
+        }
 
-        // Determine user tag from filename
-        const base = filename.toLowerCase();
-        let user = 'unknown';
-        if (base.includes('riaan') || base.includes('rj')) user = 'RJ';
-        else if (base.includes('cdw')) user = 'CW';
-        else if (base.includes('pot')) user = 'POT';
-
-        // Format into a GRN lookup dictionary for Firebase
-        const stockByGrn = {};
+        // Map data by GRN for Firebase storage
+        const dataByGrn = {};
         rows.forEach(r => {
-          stockByGrn[r.grn] = {
+          const key = r.grn || `row_${Math.random()}`;
+          dataByGrn[key] = {
             ...r,
             user: user,
             source_file: filename
           };
         });
 
-        // 3. Push verified data to Firebase
-        await db.ref(`stock/${user}`).set(stockByGrn);
-        console.log(`   ✅ Stock pushed & verified: /stock/${user} — ${rows.length} rows from ${filename}`);
+        await db.ref(dbPath).set(dataByGrn);
+        console.log(`   ✅ Verified & pushed: /${dbPath} — ${rows.length} rows from ${filename}`);
 
         return res.status(200).json({
           status: 'success',
           filename: filename,
           user: user,
           rows_processed: rows.length,
-          audit: auditResult.status
+          type: isFloorReport ? 'floor_balance' : 'stock'
         });
 
       } catch (parseErr) {
@@ -119,12 +125,11 @@ app.post('/trigger-stock', async (req, res) => {
 
   } catch (err) {
     if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-    console.error(`❌ Error processing request: ${err.message}`);
     return res.status(500).json({ error: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
   console.log(`🚀 JDW Sync Server running on port ${PORT}`);
 });
