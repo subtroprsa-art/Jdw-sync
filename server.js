@@ -41,7 +41,7 @@ app.use(cors({
 app.options('*', cors());  // handle preflight for all routes
 app.use(express.json());
 
-// ── Filename → user + date ────────────────────────────────────────────────────
+// ── Filename → user + date ────────────────────────────────────────────────----
 // DDMMYYYYPOT.pdf → RJ   DDMMYYYYCDW.pdf → CW   DDMMYYYYriaan.pdf → RJ
 function parseFilename(filename) {
   const base = path.basename(filename, '.pdf').toLowerCase();
@@ -61,7 +61,7 @@ function parsePDF(pdfPath, user, dateStr) {
     const args = [PARSER, pdfPath, user || '', dateStr || ''].filter(Boolean);
     execFile('python3', args, { timeout: 120_000, maxBuffer: 10 * 1024 * 1024 },
       (err, stdout, stderr) => {
-        if (stderr) console.warn('[parser]', stderr.trim());
+        if (stderr) console.warn('[parser stderr]:', stderr.trim());
         if (err)    return reject(new Error(`Parser failed: ${stderr || err.message}`));
         try {
           const result = JSON.parse(stdout);
@@ -81,11 +81,16 @@ function normaliseEntries(rows, filenameDate, user) {
     .filter(r => r && (r.producer || r.grn || r.commodity))
     .map((r, i) => ({
       id:          `${Date.now()}_${i}`,
-      user:        r._user  || user,
-      date:        r.date   || filenameDate || new Date().toISOString().slice(0, 10),
+      user:        r.user || user,
+      date:        r.date || filenameDate || new Date().toISOString().slice(0, 10),
       producer:    String(r.producer  || '').trim(),
       grn:         String(r.grn       || '').trim(),
       commodity:   String(r.commodity || '').trim(),
+      pack:        String(r.pack      || '').trim(),
+      variety:     String(r.variety   || '*').trim(),
+      grade:       String(r.grade     || '1').trim(),
+      size:        String(r.size      || '*').trim(),
+      count:       String(r.count     || '*').trim(),
       qty_rec:     Number(r.qty_rec)  || 0,
       qty_sort:    Number(r.qty_sort) || 0,
       source:      'pdf',
@@ -123,12 +128,15 @@ async function handleUpload(req, res, clearFirst) {
       });
     }
 
-    // Write to Firebase
+    // Write to Firebase as a GRN-indexed map or key-indexed entries
     const updates = {};
-    for (const e of entries) updates[`/stock/${e.user}/${e.id}`] = e;
+    for (const e of entries) {
+      const key = e.grn || e.id;
+      updates[`/stock/${e.user.toUpperCase()}/${key}`] = e;
+    }
     await db.ref().update(updates);
 
-    return res.json({ success: true, user: finalUser, date: dateStr, count: entries.length, entries });
+    return res.json({ success: true, user: finalUser.toUpperCase(), date: dateStr, count: entries.length, entries });
 
   } catch (err) {
     console.error('[upload] error:', err.message);
@@ -150,7 +158,7 @@ app.post('/clear-and-upload', upload.single('pdf'), (req, res) => handleUpload(r
 app.get('/stock/:user', async (req, res) => {
   try {
     const { user } = req.params;
-    const ref  = user === 'all' ? db.ref('/stock') : db.ref(`/stock/${user}`);
+    const ref  = user === 'all' ? db.ref('/stock') : db.ref(`/stock/${user.toUpperCase()}`);
     const snap = await ref.once('value');
     return res.json(snap.val() || {});
   } catch (err) {
@@ -162,10 +170,10 @@ app.get('/stock/:user', async (req, res) => {
 app.delete('/stock/:user', async (req, res) => {
   try {
     const { user } = req.params;
-    const ref = user === 'all' ? db.ref('/stock') : db.ref(`/stock/${user}`);
+    const ref = user === 'all' ? db.ref('/stock') : db.ref(`/stock/${user.toUpperCase()}`);
     await ref.remove();
     console.log(`[clear] wiped stock for user=${user}`);
-    return res.json({ success: true, user });
+    return res.json({ success: true, user: user.toUpperCase() });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -174,7 +182,7 @@ app.delete('/stock/:user', async (req, res) => {
 // Delete single entry
 app.delete('/stock/:user/:id', async (req, res) => {
   try {
-    await db.ref(`/stock/${req.params.user}/${req.params.id}`).remove();
+    await db.ref(`/stock/${req.params.user.toUpperCase()}/${req.params.id}`).remove();
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -184,7 +192,7 @@ app.delete('/stock/:user/:id', async (req, res) => {
 // Health
 app.get('/', (_req, res) => res.send('jdw-sync alive'));
 
-// Start
+// Start Server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`jdw-sync listening on :${PORT}`));
 
