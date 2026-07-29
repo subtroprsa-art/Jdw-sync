@@ -18,28 +18,55 @@ def parse_stock_report(pdf_path):
                         continue
                         
                     line_lower = line_clean.lower()
-                    # Skip summary and bag total rows
-                    if "total" in line_lower or re.search(r'\d+\s*kg', line_lower):
+                    # Skip header, total, and bag weight rows
+                    if "total" in line_lower or re.search(r'\d+\s*kg', line_lower) or "grn" in line_lower:
                         continue
                         
-                    # Split columns by multiple spaces
-                    cols = [c.strip() for c in re.split(r'\s{2,}', line_clean) if c.strip()]
-                    if len(cols) >= 3:
-                        # Map text columns to the keys your Node backend checks
-                        # Adjust indices based on your specific PDF column layout if needed
-                        record = {
-                            "grn": cols[0] if len(cols) > 0 else "",
-                            "producer": cols[1] if len(cols) > 1 else "",
-                            "commodity": cols[2] if len(cols) > 2 else "UNK",
-                            "pack": cols[3] if len(cols) > 3 else "",
-                            "variety": cols[4] if len(cols) > 4 else "*",
-                            "grade": cols[5] if len(cols) > 5 else "1",
-                            "size": cols[6] if len(cols) > 6 else "*",
-                            "count": cols[7] if len(cols) > 7 else "*",
-                            "qty_rec": int(cols[8]) if len(cols) > 8 and cols[8].isdigit() else 0,
-                            "qty_sort": int(cols[9]) if len(cols) > 9 and cols[9].isdigit() else 0
-                        }
-                        parsed_records.append(record)
+                    # Tokenize the line by whitespace
+                    tokens = line_clean.split()
+                    if len(tokens) < 5:
+                        continue
+                        
+                    # Look for a GRN pattern (typically a 7-8 digit number like 15379866)
+                    grn_index = -1
+                    for idx, token in enumerate(tokens):
+                        if re.match(r'^\d{7,8}$', token):
+                            grn_index = idx
+                            break
+                            
+                    if grn_index == -1:
+                        continue
+                        
+                    # Extract fields relative to the found GRN position
+                    grn = tokens[grn_index]
+                    # Producer is usually everything before the GRN
+                    producer = " ".join(tokens[:grn_index]).strip()
+                    
+                    # Commodity, pack, variety, quantities typically follow after GRN
+                    remainder = tokens[grn_index + 1:]
+                    
+                    commodity = remainder[0] if len(remainder) > 0 else "UNK"
+                    pack = remainder[1] if len(remainder) > 1 else ""
+                    variety = remainder[2] if len(remainder) > 2 else "*"
+                    
+                    # Pull trailing numbers for quantities (Qty Rec and Qty Sort are usually at the tail end of the line)
+                    numbers = [t for t in remainder if t.isdigit()]
+                    qty_rec = int(numbers[0]) if len(numbers) > 0 else 0
+                    qty_sort = int(numbers[-1]) if len(numbers) > 1 else 0
+
+                    record = {
+                        "grn": grn,
+                        "producer": producer,
+                        "commodity": commodity,
+                        "pack": pack,
+                        "variety": variety,
+                        "grade": "1",
+                        "size": "*",
+                        "count": "*",
+                        "qty_rec": qty_rec,
+                        "qty_sort": qty_sort
+                    }
+                    parsed_records.append(record)
                             
     except Exception as e:
         print(f"Error parsing PDF: {str(e)}", file=sys.stderr)
