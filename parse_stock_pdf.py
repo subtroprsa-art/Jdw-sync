@@ -7,8 +7,7 @@ def parse_stock_report(pdf_path):
     table_settings = {
         "vertical_strategy": "text",
         "horizontal_strategy": "text",
-        "snap_tolerance": 4,
-        "keep_blank_chars": True
+        "snap_tolerance": 4
     }
     
     parsed_records = []
@@ -40,3 +39,4 @@ if __name__ == "__main__":
     # Expects the PDF file path passed as a command-line argument from your Node backend
     target_pdf = sys.argv[1] if len(sys.argv) > 1 else "stock_report.pdf"
     parse_stock_report(target_pdf)
+    
