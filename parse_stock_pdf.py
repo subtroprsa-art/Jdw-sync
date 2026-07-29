@@ -17,10 +17,8 @@ def parse_stock_report(pdf_path):
             tables = page.extract_tables(table_settings)
             for table in tables:
                 for row in table:
-                    # Clean up each cell in the row
                     cleaned_row = [cell.strip().replace("\n", " ") if cell else "" for cell in row]
                     
-                    # Skip empty rows
                     if not any(cleaned_row):
                         continue
                         
@@ -32,11 +30,14 @@ def parse_stock_report(pdf_path):
                         
                     parsed_records.append(cleaned_row)
 
-    # Output as JSON so your Node.js backend server.js / index.js can catch and ingest it cleanly
     print(json.dumps(parsed_records))
 
 if __name__ == "__main__":
-    # Expects the PDF file path passed as a command-line argument from your Node backend
-    target_pdf = sys.argv[1] if len(sys.argv) > 1 else "stock_report.pdf"
+    # Filter command line arguments to find the one ending with .pdf
+    target_pdf = "stock_report.pdf"
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith(".pdf"):
+            target_pdf = arg
+            break
+            
     parse_stock_report(target_pdf)
-    
