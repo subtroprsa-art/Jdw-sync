@@ -13,6 +13,3 @@
     "tesseract.js": "^5.0.0"
   }
 }
-```[cite: 2]
-
-Once saved with valid JSON formatting, Render will boot up successfully and clear that crash error.
