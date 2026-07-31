@@ -42,25 +42,16 @@ def parse_stock_report(pdf_path):
                     producer = " ".join(tokens[:grn_index]).strip()
                     remainder = tokens[grn_index + 1:]
                     
+                    # Fix: Explicitly map tokens based on standard layout positions after GRN
                     commodity = remainder[0] if len(remainder) > 0 else "UNK"
                     pack = remainder[1] if len(remainder) > 1 else ""
                     variety = remainder[2] if len(remainder) > 2 else "*"
                     
-                    # Isolate pure numeric tokens from the remainder
+                    # Isolate pure numeric tokens for quantities
                     numbers = [t for t in remainder if t.isdigit()]
                     
-                    # Standard column layout mapping based on PDF structure:
-                    # [Commodity, Pack, Variety, Qty Rec, Qty Sold, D/R, Cold Store, Qty Sort]
                     qty_rec = int(numbers[0]) if len(numbers) > 0 else 0
-                    
-                    # Extract Cold Store value accurately (typically second-to-last or positioned near sort)
-                    # Adjust index mapping safely based on available numbers count
-                    coldstore = "0"
-                    if len(numbers) >= 4:
-                        coldstore = numbers[-2] # Positioned right before final sort/bal count
-                    elif len(numbers) == 3:
-                        coldstore = numbers[1]
-                        
+                    coldstore = str(numbers[-2]) if len(numbers) >= 3 else "0"
                     qty_sort = int(numbers[-1]) if len(numbers) > 1 else 0
 
                     record = {
