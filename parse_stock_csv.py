@@ -32,15 +32,14 @@ except Exception as init_error:
 
 def parse_commodity(commodity_str):
     """
-    Parses commodity string format: e.g., APP,CT185,GS,1,*,100,*
+    Parses commodity string format safely: e.g., APP,CT185,GS,1,*,100,*
     Returns a structured dictionary of its components.
     """
-    if not commodity_str:
+    if not commodity_str or not isinstance(commodity_str, str):
         return {}
     
     parts = [p.strip() for p in commodity_str.split(',')]
     
-    # Mapping based on standard structure: product, packaging_weight, variety, class, placeholder1, count, placeholder2
     parsed = {
         "raw": commodity_str,
         "product": parts[0] if len(parts) > 0 else "",
@@ -68,19 +67,34 @@ def parse_csv(file_path):
             batch_data = {}
 
             for row in reader:
-                grn_no = row.get('GRN_NO', '').strip()
-                if not grn_no or not row.get('PRODUCER'):
+                if not row:
+                    continue
+                
+                grn_val = row.get('GRN_NO')
+                grn_no = str(grn_val).strip() if grn_val is not None else ''
+                
+                producer_val = row.get('PRODUCER')
+                producer = str(producer_val).strip() if producer_val is not None else ''
+
+                if not grn_no or not producer:
                     continue
                 
                 total_rows += 1
                 
-                # Parse quantities safely
-                qty_rec = int(float(row.get('QTY_REC', 0) or 0))
-                qty_sold = int(float(row.get('QTY_SOLD', 0) or 0))
-                qty_floor = int(float(row.get('QTY_FLOOR', 0) or 0))
+                # Parse quantities safely with None checks
+                qty_rec_val = row.get('QTY_REC', 0)
+                qty_rec = int(float(qty_rec_val)) if qty_rec_val is not None and str(qty_rec_val).strip() != '' else 0
+
+                qty_sold_val = row.get('QTY_SOLD', 0)
+                qty_sold = int(float(qty_sold_val)) if qty_sold_val is not None and str(qty_sold_val).strip() != '' else 0
+
+                qty_floor_val = row.get('QTY_FLOOR', 0)
+                qty_floor = int(float(qty_floor_val)) if qty_floor_val is not None and str(qty_floor_val).strip() != '' else 0
                 
                 # Cold store row calculation using CSSUM (Column W)
-                coldstore_val = row.get('CSSUM', '').strip()
+                cssum_val = row.get('CSSUM')
+                coldstore_val = str(cssum_val).strip() if cssum_val is not None else ''
+                
                 if not coldstore_val or coldstore_val == '0' or coldstore_val == '0.0':
                     derived_cs = qty_rec - qty_sold - qty_floor
                     coldstore_val = str(max(0, derived_cs))
@@ -90,15 +104,19 @@ def parse_csv(file_path):
                     except ValueError:
                         pass
 
-                raw_commodity = row.get('COMMODITY', '').strip()
+                raw_comm_val = row.get('COMMODITY')
+                raw_commodity = str(raw_comm_val).strip() if raw_comm_val is not None else ''
                 commodity_details = parse_commodity(raw_commodity)
+
+                date_rec_val = row.get('DATE_RECEIVED')
+                date_received = str(date_rec_val).strip() if date_rec_val is not None else ''
 
                 record = {
                     "grn": grn_no,
-                    "producer": row.get('PRODUCER', '').strip(),
+                    "producer": producer,
                     "commodity": raw_commodity,
                     "commodity_details": commodity_details,
-                    "date_received": row.get('DATE_RECEIVED', '').strip(),
+                    "date_received": date_received,
                     "coldstore": coldstore_val,
                     "qty_rec": qty_rec,
                     "qty_sold": qty_sold,
@@ -116,8 +134,7 @@ def parse_csv(file_path):
         print(json.dumps({
             "status": "SUCCESS",
             "total_rows": total_rows,
-            "records_saved_to_realtime_db": len(records),
-            "records": records
+            "records_saved_to_realtime_db": len(records)
         }, indent=2))
 
     except Exception as e:
