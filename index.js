@@ -4,6 +4,25 @@ const fs = require('fs');
 const path = require('path');
 const admin = require('firebase-admin');
 const { google } = require('googleapis');
+
+const app = express();
+app.use(express.json());
+
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: process.env.FIREBASE_DATABASE_URL
+});
+const db = admin.database();
+
+const auth = new google.auth.GoogleAuth({
+  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || '{}'),
+  scopes: ['https://www.googleapis.com/auth/drive.readonly']
+});
+const drive = google.drive({ version: 'v3', auth });
+
+const TRIGGER_SECRET = process.env.TRIGGER_SECRET || 'jdw-trigger-2026';
+
 // Helper to clean commodity names for the pipeline and UI
 function getFriendlyProductName(rawName) {
     if (!rawName) return 'Produce';
@@ -97,29 +116,10 @@ async function updateDedicatedNodes() {
 
     await db.ref().update(updates);
     console.log("✅ Dedicated nodes successfully updated on backend.");
-      // Trigger background sync to dedicated frontend nodes
-        await updateDedicatedNodes();
   } catch (err) {
     console.error("❌ Error updating dedicated nodes:", err);
   }
 }
-const app = express();
-app.use(express.json());
-
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || '{}');
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DATABASE_URL
-});
-const db = admin.database();
-
-const auth = new google.auth.GoogleAuth({
-  credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT || '{}'),
-  scopes: ['https://www.googleapis.com/auth/drive.readonly']
-});
-const drive = google.drive({ version: 'v3', auth });
-
-const TRIGGER_SECRET = process.env.TRIGGER_SECRET || 'jdw-trigger-2026';
 
 // Helper function to download file from Google Drive and run a Python script parser
 async function handlePdfProcessing(req, res, isFloor) {
@@ -207,6 +207,9 @@ async function handlePdfProcessing(req, res, isFloor) {
 
         await db.ref(dbPath).set(dataByGrn);
         console.log(`   ✅ Verified & pushed: /${dbPath} — ${rows.length} rows from ${filename}`);
+
+        // Trigger background sync to dedicated frontend nodes
+        await updateDedicatedNodes();
 
         return res.status(200).json({
           status: 'success',
