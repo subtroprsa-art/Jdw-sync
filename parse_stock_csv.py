@@ -2,23 +2,30 @@ import csv
 import json
 import sys
 import os
-import firebase_admin
-from firebase_admin import credentials, firestore
 
-# Initialize Firebase Admin using Render's environment variable
-if not firebase_admin._apps:
-    service_account_env = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
-    if service_account_env:
-        try:
-            cred_dict = json.loads(service_account_env)
-            cred = credentials.Certificate(cred_dict)
-        except json.JSONDecodeError:
-            cred = credentials.Certificate(service_account_env)
-        firebase_admin.initialize_app(cred)
-    else:
-        firebase_admin.initialize_app()
+# Safe initialization wrapper to catch startup errors
+db = None
+try:
+    import firebase_admin
+    from firebase_admin import credentials, firestore
 
-db = firestore.client()
+    if not firebase_admin._apps:
+        service_account_env = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+        if service_account_env:
+            try:
+                cred_dict = json.loads(service_account_env)
+                cred = credentials.Certificate(cred_dict)
+            except json.JSONDecodeError:
+                cred = credentials.Certificate(service_account_env)
+            firebase_admin.initialize_app(cred)
+        else:
+            firebase_admin.initialize_app()
+
+    db = firestore.client()
+except Exception as init_error:
+    # Print initialization error directly to stderr so Node.js catches it
+    print(f"FIREBASE_INIT_ERROR: {str(init_error)}", file=sys.stderr)
+    sys.exit(1)
 
 def parse_csv(file_path):
     records = []
@@ -26,14 +33,12 @@ def parse_csv(file_path):
 
     try:
         with open(file_path, mode='r', encoding='utf-8-sig', errors='ignore') as file:
-            # Use delimiter='\t' since the data columns are tab-separated[cite: 2]
             reader = csv.DictReader(file, delimiter='\t')
             
             batch = db.batch()
             batch_count = 0
 
             for row in reader:
-                # Skip summary or blank trailing rows if any[cite: 2]
                 if not row.get('GRN_NO') and not row.get('PRODUCER'):
                     continue
                 
@@ -50,12 +55,10 @@ def parse_csv(file_path):
                 }
                 records.append(record)
 
-                # Save record to Firestore collection 'stock_inventory'
                 doc_ref = db.collection('stock_inventory').document(record["grn"])
                 batch.set(doc_ref, record)
                 batch_count += 1
 
-                # Firestore batch limit is 500 writes
                 if batch_count >= 400:
                     batch.commit()
                     batch = db.batch()
