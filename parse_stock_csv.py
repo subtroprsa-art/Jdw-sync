@@ -1,89 +1,40 @@
 import csv
-import json
-import sys
-import os
+import firebase_admin
+from firebase_admin import credentials
+from firebase_admin import db
 
-try:
-    import firebase_admin
-    from firebase_admin import credentials, db
+# Initialize Firebase (update path to your service account key and database URL)
+cred = credentials.Certificate("serviceAccountKey.json")
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://YOUR-DATABASE-NAME.firebaseio.com/'
+})
 
-    if not firebase_admin._apps:
-        service_account_env = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
-        database_url = "https://jdw-crm-default-rtdb.firebaseio.com/"
+def parse_and_upload_stock(csv_filename):
+    ref = db.reference('stock_inventory')
+    
+    with open(csv_filename, mode='r', encoding='utf-8') as file:
+        reader = csv.DictReader(file)
         
-        if service_account_env:
-            try:
-                cred_dict = json.loads(service_account_env)
-                cred = credentials.Certificate(cred_dict)
-            except json.JSONDecodeError:
-                cred = credentials.Certificate(service_account_env)
-            
-            firebase_admin.initialize_app(cred, {
-                'databaseURL': database_url
-            })
-        else:
-            firebase_admin.initialize_app({
-                'databaseURL': database_url
-            })
-
-except Exception as init_error:
-    print(f"FIREBASE_INIT_ERROR: {str(init_error)}", file=sys.stderr)
-    sys.exit(1)
-
-def parse_csv(file_path):
-    records = []
-    total_rows = 0
-
-    try:
-        with open(file_path, mode='r', encoding='utf-8-sig', errors='ignore') as file:
-            reader = csv.DictReader(file, delimiter='\t')
-            
-            ref = db.reference('stock_inventory')
-            batch_data = {}
-
-            for row in reader:
-                if not row.get('GRN_NO') and not row.get('PRODUCER'):
-                    continue
+        for row in reader:
+            # Skip rows that don't have a GRN number (like summary or empty lines)
+            grn_no = row.get('GRN_NO', '').strip()
+            if not grn_no:
+                continue
                 
-                total_rows += 1
-                
-                record = {
-                    "grn": row.get('GRN_NO', '').strip(),
-                    "producer": row.get('PRODUCER', '').strip(),
-                    "commodity": row.get('COMMODITY', '').strip(),
-                    "date_received": row.get('DATE_RECEIVED', '').strip(),
-                    "qty_rec": int(row.get('QTY_REC', 0) or 0),
-                    "qty_sold": int(row.get('QTY_SOLD', 0) or 0),
-                    "qty_floor": int(row.get('QTY_FLOOR', 0) or 0)
-                }
-                records.append(record)
+            record = {
+                "grn": grn_no,
+                "producer": row.get('PRODUCER', '').strip(),
+                "commodity": row.get('COMMODITY', '').strip(),
+                "date_received": row.get('DATE_RECEIVED', '').strip(),
+                "coldstore": row.get('CS_SUMAGTQTYCSTORE', '').strip() or row.get('COLDSTORE', '').strip() or "0",
+                "qty_rec": int(row.get('QTY_REC', 0) or 0),
+                "qty_sold": int(row.get('QTY_SOLD', 0) or 0),
+                "qty_floor": int(row.get('QTY_FLOOR', 0) or 0)
+            }
+            
+            # Push or set data in Firebase keyed by GRN
+            ref.child(grn_no).set(record)
+            print(f"Successfully uploaded GRN: {grn_no} with coldstore: {record['coldstore']}")
 
-                # Use GRN as the key in Realtime Database
-                grn_key = record["grn"].replace('/', '_').replace('.', '_')
-                if grn_key:
-                    batch_data[grn_key] = record
-
-            # Push all data directly to your Realtime Database URL
-            if batch_data:
-                ref.update(batch_data)
-
-        print(json.dumps({
-            "status": "SUCCESS",
-            "total_rows": total_rows,
-            "records_saved_to_realtime_db": len(records),
-            "records": records
-        }))
-
-    except Exception as e:
-        print(json.dumps({
-            "status": "ERROR",
-            "message": str(e)
-        }))
-        sys.exit(1)
-
-if __name__ == '__main__':
-    if len(sys.argv) > 1:
-        parse_csv(sys.argv[1])
-    else:
-        print(json.dumps({"status": "ERROR", "message": "No file path provided"}))
-        sys.exit(1)
+if __name__ == "__main__":
+    parse_and_upload_stock("riaan300072026csv.txt")
