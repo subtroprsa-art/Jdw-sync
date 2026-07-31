@@ -5,8 +5,6 @@ import json
 
 def parse_stock_report(pdf_path):
     parsed_records = []
-    official_floor_total = 0
-    official_rec_total = 0
     
     try:
         with pdfplumber.open(pdf_path) as pdf:
@@ -23,19 +21,8 @@ def parse_stock_report(pdf_path):
                         
                     line_lower = line_clean.lower()
                     
-                    # Capture official footer totals if present in the text layout
-                    if "total" in line_lower:
-                        nums = re.findall(r'\b\d+\b', line_clean)
-                        if len(nums) >= 2:
-                            # Usually the last or second-to-last numbers in the total line represent totals
-                            try:
-                                # Keep track of potential footer totals for auditing
-                                pass
-                            except ValueError:
-                                pass
-                        continue
-                        
-                    if re.search(r'\d+\s*kg', line_lower) or "grn" in line_lower:
+                    # Skip header, footer total lines, or weight summary lines
+                    if "total" in line_lower or re.search(r'\d+\s*kg', line_lower) or "grn" in line_lower:
                         continue
                         
                     tokens = line_clean.split()
@@ -59,8 +46,21 @@ def parse_stock_report(pdf_path):
                     pack = remainder[1] if len(remainder) > 1 else ""
                     variety = remainder[2] if len(remainder) > 2 else "*"
                     
+                    # Isolate pure numeric tokens from the remainder
                     numbers = [t for t in remainder if t.isdigit()]
+                    
+                    # Standard column layout mapping based on PDF structure:
+                    # [Commodity, Pack, Variety, Qty Rec, Qty Sold, D/R, Cold Store, Qty Sort]
                     qty_rec = int(numbers[0]) if len(numbers) > 0 else 0
+                    
+                    # Extract Cold Store value accurately (typically second-to-last or positioned near sort)
+                    # Adjust index mapping safely based on available numbers count
+                    coldstore = "0"
+                    if len(numbers) >= 4:
+                        coldstore = numbers[-2] # Positioned right before final sort/bal count
+                    elif len(numbers) == 3:
+                        coldstore = numbers[1]
+                        
                     qty_sort = int(numbers[-1]) if len(numbers) > 1 else 0
 
                     record = {
@@ -73,6 +73,7 @@ def parse_stock_report(pdf_path):
                         "size": "*",
                         "count": "*",
                         "qty_rec": qty_rec,
+                        "coldstore": coldstore,
                         "qty_sort": qty_sort
                     }
                     parsed_records.append(record)
