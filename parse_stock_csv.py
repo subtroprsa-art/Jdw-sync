@@ -3,27 +3,30 @@ import json
 import sys
 import os
 
-# Safe initialization wrapper to catch startup errors
-db = None
 try:
     import firebase_admin
-    from firebase_admin import credentials, firestore
+    from firebase_admin import credentials, db
 
     if not firebase_admin._apps:
         service_account_env = os.environ.get('FIREBASE_SERVICE_ACCOUNT')
+        database_url = "https://jdw-crm-default-rtdb.firebaseio.com/"
+        
         if service_account_env:
             try:
                 cred_dict = json.loads(service_account_env)
                 cred = credentials.Certificate(cred_dict)
             except json.JSONDecodeError:
                 cred = credentials.Certificate(service_account_env)
-            firebase_admin.initialize_app(cred)
+            
+            firebase_admin.initialize_app(cred, {
+                'databaseURL': database_url
+            })
         else:
-            firebase_admin.initialize_app()
+            firebase_admin.initialize_app({
+                'databaseURL': database_url
+            })
 
-    db = firestore.client()
 except Exception as init_error:
-    # Print initialization error directly to stderr so Node.js catches it
     print(f"FIREBASE_INIT_ERROR: {str(init_error)}", file=sys.stderr)
     sys.exit(1)
 
@@ -35,8 +38,8 @@ def parse_csv(file_path):
         with open(file_path, mode='r', encoding='utf-8-sig', errors='ignore') as file:
             reader = csv.DictReader(file, delimiter='\t')
             
-            batch = db.batch()
-            batch_count = 0
+            ref = db.reference('stock_inventory')
+            batch_data = {}
 
             for row in reader:
                 if not row.get('GRN_NO') and not row.get('PRODUCER'):
@@ -55,22 +58,19 @@ def parse_csv(file_path):
                 }
                 records.append(record)
 
-                doc_ref = db.collection('stock_inventory').document(record["grn"])
-                batch.set(doc_ref, record)
-                batch_count += 1
+                # Use GRN as the key in Realtime Database
+                grn_key = record["grn"].replace('/', '_').replace('.', '_')
+                if grn_key:
+                    batch_data[grn_key] = record
 
-                if batch_count >= 400:
-                    batch.commit()
-                    batch = db.batch()
-                    batch_count = 0
-
-            if batch_count > 0:
-                batch.commit()
+            # Push all data directly to your Realtime Database URL
+            if batch_data:
+                ref.update(batch_data)
 
         print(json.dumps({
             "status": "SUCCESS",
             "total_rows": total_rows,
-            "records_saved_to_firebase": len(records),
+            "records_saved_to_realtime_db": len(records),
             "records": records
         }))
 
