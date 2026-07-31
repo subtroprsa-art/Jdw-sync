@@ -97,6 +97,8 @@ async function updateDedicatedNodes() {
 
     await db.ref().update(updates);
     console.log("✅ Dedicated nodes successfully updated on backend.");
+      // Trigger background sync to dedicated frontend nodes
+        await updateDedicatedNodes();
   } catch (err) {
     console.error("❌ Error updating dedicated nodes:", err);
   }
