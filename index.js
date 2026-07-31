@@ -29,8 +29,14 @@ app.post('/trigger-stock', (req, res) => {
 
         if (error) {
             console.error(`Execution error: ${error.message}`);
-            console.error(`Python Error Output (stderr): ${stderr}`); // <-- Logs the exact python traceback
-            return res.status(500).json({ status: "ERROR", message: error.message, details: stderr });
+            console.error(`STDOUT output: ${stdout}`);
+            console.error(`STDERR output: ${stderr}`);
+            return res.status(500).json({ 
+                status: "ERROR", 
+                message: error.message, 
+                stdout: stdout, 
+                details: stderr 
+            });
         }
         
         try {
