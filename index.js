@@ -4,7 +4,103 @@ const fs = require('fs');
 const path = require('path');
 const admin = require('firebase-admin');
 const { google } = require('googleapis');
+// Helper to clean commodity names for the pipeline and UI
+function getFriendlyProductName(rawName) {
+    if (!rawName) return 'Produce';
+    let clean = rawName.toString().split(',')[0].replace(/\d{1,2}[\/\-]\w{3}[\/\-]\d{4}/g, '').trim();
+    const upper = clean.toUpperCase();
+    if (upper.includes('ORG') || upper.includes('ORANGE')) return 'Oranges';
+    if (upper.includes('AVO') || upper.includes('AVOCADO')) return 'Avos';
+    if (upper.includes('LEM') || upper.includes('LEMON')) return 'Lemons';
+    if (upper.includes('NOV')) return 'Nova';
+    if (upper.includes('BER')) return 'Berries';
+    if (upper.includes('NUT')) return 'Nuts';
+    return clean || 'Produce';
+}
 
+// Master data distributor to update dedicated frontend nodes automatically on backend writes
+async function updateDedicatedNodes() {
+  try {
+    console.log("⚡ Rebuilding dedicated Firebase nodes...");
+    
+    const stockSnap = await db.ref('stock').once('value');
+    const stockVal = stockSnap.val() || {};
+    
+    let totalUnits = 0;
+    const normalizedUIStock = [];
+    const normalizedPipelineStock = [];
+
+    // Flatten multi-user stock tree (RJ, CDW, POT)
+    for (const userKey in stockVal) {
+      const userStock = stockVal[userKey];
+      for (const itemKey in userStock) {
+        const item = userStock[itemKey];
+        if (!item || typeof item !== 'object') continue;
+
+        const balanceVal = Number(
+            item.balance !== undefined ? item.balance :
+            (item.flr !== undefined ? item.flr :
+            (item.count !== undefined ? item.count :
+            (item.qty !== undefined ? item.qty :
+            (item.qty_rec !== undefined ? item.qty_rec : 0))))
+        ) || 0;
+
+        totalUnits += balanceVal;
+
+        normalizedUIStock.push({
+          id: itemKey,
+          producer: item.producer || item.farm || userKey,
+          commodity: item.commodity || item.comm || item.variety || 'PRODUCE',
+          grn: item.grn || '-',
+          balance: balanceVal,
+          pack: item.pack || item.size || '-'
+        });
+
+        normalizedPipelineStock.push({
+          id: itemKey,
+          friendly_name: getFriendlyProductName(item.commodity || item.comm || item.item),
+          pack: item.pack || (item.size ? `${item.size}kg` : ''),
+          qty: balanceVal
+        });
+      }
+    }
+
+    // Grab buyers to compute total revenue if available
+    const buyersSnap = await db.ref('buyers').once('value');
+    const buyersVal = buyersSnap.val() || {};
+    let totalRev = 0;
+    let buyerCount = 0;
+
+    if (Array.isArray(buyersVal)) {
+      buyerCount = buyersVal.length;
+      buyersVal.forEach(b => {
+        totalRev += Number(b.turnover || b.totalSpent || b.revenue || 0) || 0;
+      });
+    } else {
+      const buyerKeys = Object.keys(buyersVal);
+      buyerCount = buyerKeys.length;
+      buyerKeys.forEach(k => {
+        const b = buyersVal[k];
+        totalRev += Number(b.turnover || b.totalSpent || b.revenue || 0) || 0;
+      });
+    }
+
+    const updates = {};
+    updates['/dashboard_kpis'] = {
+      total_floor_units: totalUnits,
+      total_buyers: buyerCount,
+      total_revenue: totalRev,
+      last_updated: Date.now()
+    };
+    updates['/ui_stock_balances'] = normalizedUIStock;
+    updates['/pipeline_data'] = normalizedPipelineStock;
+
+    await db.ref().update(updates);
+    console.log("✅ Dedicated nodes successfully updated on backend.");
+  } catch (err) {
+    console.error("❌ Error updating dedicated nodes:", err);
+  }
+}
 const app = express();
 app.use(express.json());
 
