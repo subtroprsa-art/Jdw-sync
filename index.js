@@ -29,6 +29,7 @@ app.post('/trigger-stock', (req, res) => {
 
         if (error) {
             console.error(`Execution error: ${error.message}`);
+            console.error(`Python Error Output (stderr): ${stderr}`); // <-- Logs the exact python traceback
             return res.status(500).json({ status: "ERROR", message: error.message, details: stderr });
         }
         
@@ -36,7 +37,8 @@ app.post('/trigger-stock', (req, res) => {
             const result = JSON.parse(stdout);
             return res.status(200).json(result);
         } catch (e) {
-            return res.status(200).json({ status: "SUCCESS", output: stdout });
+            console.error(`Failed to parse Python stdout: ${stdout}`);
+            return res.status(500).json({ status: "ERROR", message: "Failed to parse Python output", output: stdout });
         }
     });
 });
